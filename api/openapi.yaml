@@ -1,0 +1,738 @@
+openapi: 3.1.0
+info:
+  title: Recipe AI core-api
+  version: 1.0.0
+  description: |
+    Domain service for Recipe AI. Owns Postgres, the recipe corpus, deterministic
+    set-coverage search, and orchestration of LLM adaptation jobs.
+
+    This file is the hand-maintained source of truth for the `web` client, which
+    generates its TypeScript types from it. Any change to the HTTP surface must
+    change this file in the same commit.
+
+    Two invariants worth knowing when reading the schemas below:
+
+    - Verbatim corpus `directions` are never exposed. Recipe steps only ever
+      appear as model-paraphrased text in `AdaptedResult.steps`.
+    - Allergens are a hard filter applied in SQL and re-checked against the model
+      output, never a request to the model to be careful.
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: http://core-api:8080
+    description: Inside the recipe-net docker network
+
+tags:
+  - name: auth
+  - name: me
+  - name: ingredients
+  - name: cook
+  - name: ops
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, examples: [ok] }
+
+  /readyz:
+    get:
+      tags: [ops]
+      summary: Readiness probe
+      description: |
+        Checks Postgres and Redis. Does **not** check llm-service: the search path
+        must stay ready while the model is down.
+      security: []
+      responses:
+        "200":
+          description: Ready to serve
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, examples: [ready] }
+        "503":
+          description: A required dependency is unreachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  error: { type: string }
+
+  /api/v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Create an account
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Credentials" }
+      responses:
+        "201":
+          description: Account created, tokens issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tokens" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: Email already registered
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Exchange credentials for tokens
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Credentials" }
+      responses:
+        "200":
+          description: Tokens issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tokens" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate a refresh token
+      description: |
+        The presented refresh token is revoked and a new pair is issued. Replaying
+        a consumed token yields 401.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200":
+          description: Tokens rotated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tokens" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  /api/v1/me/prefs:
+    get:
+      tags: [me]
+      summary: Read preferences
+      responses:
+        "200":
+          description: Current preferences
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Prefs" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [me]
+      summary: Replace preferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Prefs" }
+      responses:
+        "200":
+          description: Saved preferences, normalised
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Prefs" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/me/ingredients:
+    get:
+      tags: [me]
+      summary: List the fridge
+      responses:
+        "200":
+          description: Fridge contents, near-expiry items first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/InventoryItem" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [me]
+      summary: Add or update a fridge item
+      description: |
+        Send either `ingredient_id` (picked from autocomplete) or a free-text
+        `name`, never both. Free-text input is resolved against the catalog; the
+        response reports whether the match was exact so the UI can confirm a
+        fuzzy hit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AddInventoryItem" }
+      responses:
+        "201":
+          description: Item stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [item, exact_match]
+                properties:
+                  item: { $ref: "#/components/schemas/InventoryItem" }
+                  resolved_from:
+                    type: string
+                    description: The free-text input this item was resolved from.
+                  exact_match:
+                    type: boolean
+                    description: False when the match came from fuzzy similarity.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/me/ingredients/{ingredientID}:
+    delete:
+      tags: [me]
+      summary: Remove a fridge item
+      parameters:
+        - name: ingredientID
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/me/history:
+    get:
+      tags: [me]
+      summary: List past adaptations
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: History, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/HistoryItem" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/me/history/{adaptedID}/rating:
+    post:
+      tags: [me]
+      summary: Rate an adaptation
+      parameters:
+        - name: adaptedID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5 }
+      responses:
+        "204": { description: Rating stored }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/ingredients:
+    get:
+      tags: [ingredients]
+      summary: Ingredient autocomplete
+      description: |
+        Prefix matches rank above substring matches, which rank above fuzzy
+        trigram matches.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 2 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      responses:
+        "200":
+          description: Matching catalog entries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/CatalogIngredient" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/cook/matches:
+    post:
+      tags: [cook]
+      summary: Find cookable recipes (synchronous, no model involved)
+      description: |
+        Deterministic SQL set-coverage over the fridge plus pantry staples,
+        excluding recipes that contain a denied allergen or a disliked ingredient.
+        Ranked by missing ingredient count, then by how many near-expiry items the
+        recipe uses, then by step count.
+
+        There is no cook-time filter: the corpus has no such field. Use
+        `max_steps` and `max_ingredients` as complexity proxies.
+
+        This endpoint does not depend on llm-service and keeps working when the
+        model is down.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MatchesRequest" }
+      responses:
+        "200":
+          description: Ranked matches
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MatchesResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/cook/adapt:
+    post:
+      tags: [cook]
+      summary: Queue an LLM adaptation job
+      description: |
+        Returns immediately with a job id; the model is never awaited inside an
+        HTTP request.
+
+        `Idempotency-Key` is **required**. Generations are slow and serialised
+        behind a single GPU, so a replayed request returns the original job rather
+        than queueing a second generation.
+
+        Omit `recipe_id` to let the model choose among your top five matches.
+        Supplying a recipe you were not offered (too many missing ingredients, or
+        an allergen conflict) is a 400.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AdaptRequest" }
+      responses:
+        "202":
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job_id, status, stream_url]
+                properties:
+                  job_id: { type: string, format: uuid }
+                  status: { $ref: "#/components/schemas/JobStatus" }
+                  stream_url: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503":
+          description: The adaptation queue is full or llm-service is busy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /api/v1/cook/jobs/{jobID}:
+    get:
+      tags: [cook]
+      summary: Job status, as SSE or as a snapshot
+      description: |
+        With `Accept: text/event-stream` this streams Server-Sent Events whose
+        event name is the job status (`queued`, `running`, `done`, `failed`) and
+        whose data is the full `Job` object. The stream closes on a terminal
+        status. With any other Accept header it returns a single JSON snapshot.
+      parameters:
+        - name: jobID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: Accept
+          in: header
+          required: false
+          schema: { type: string, examples: ["text/event-stream"] }
+      responses:
+        "200":
+          description: Job state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+            text/event-stream:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    BadRequest:
+      description: Invalid input
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: No such resource
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    TooManyRequests:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - invalid_input
+                - unauthorized
+                - forbidden
+                - not_found
+                - conflict
+                - too_many_requests
+                - payload_too_large
+                - unavailable
+                - internal
+            message: { type: string }
+
+    Credentials:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 10 }
+
+    Tokens:
+      type: object
+      required: [access_token, refresh_token, expires_at, token_type]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+          description: Expiry of the access token, not the refresh token.
+        token_type: { type: string, examples: [Bearer] }
+
+    Prefs:
+      type: object
+      required: [allergens, diets, disliked_ingredient_ids, cuisines]
+      properties:
+        allergens:
+          type: array
+          description: |
+            Hard exclusions. Closed vocabulary: an unknown tag is rejected rather
+            than ignored, because silently filtering nothing is the dangerous
+            failure direction for an allergy.
+          items:
+            type: string
+            enum:
+              [dairy, eggs, fish, shellfish, tree_nuts, peanuts, wheat, gluten,
+               soy, sesame, mustard, celery, sulfites]
+        diets:
+          type: array
+          description: |
+            Soft signals passed to the model. `gluten_free` and `dairy_free` also
+            widen the hard allergen deny-list.
+          items:
+            type: string
+            enum:
+              [vegetarian, vegan, pescatarian, halal, kosher, keto, paleo,
+               low_carb, low_sodium, gluten_free, dairy_free]
+        disliked_ingredient_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        cuisines:
+          type: array
+          items: { type: string }
+
+    CatalogIngredient:
+      type: object
+      required: [id, canonical_name, is_staple]
+      properties:
+        id: { type: integer, format: int64 }
+        canonical_name: { type: string }
+        category: { type: string }
+        allergens:
+          type: array
+          items: { type: string }
+        is_staple:
+          type: boolean
+          description: Staples are assumed present and never counted as missing.
+
+    InventoryItem:
+      type: object
+      required: [ingredient_id, canonical_name, use_soon]
+      properties:
+        ingredient_id: { type: integer, format: int64 }
+        canonical_name: { type: string }
+        category: { type: string }
+        qty: { type: number }
+        unit: { type: string }
+        expires_at: { type: string, format: date }
+        use_soon:
+          type: boolean
+          description: Expires within three days; ranking and the model prioritise these.
+
+    AddInventoryItem:
+      type: object
+      description: Exactly one of ingredient_id or name must be present.
+      properties:
+        ingredient_id: { type: integer, format: int64 }
+        name: { type: string }
+        qty: { type: number, exclusiveMinimum: 0 }
+        unit: { type: string }
+        expires_at: { type: string, format: date }
+
+    MatchesRequest:
+      type: object
+      properties:
+        max_missing:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 3
+          description: How many ingredients the user is willing to shop for.
+        max_steps: { type: integer, minimum: 1 }
+        max_ingredients: { type: integer, minimum: 1 }
+        categories:
+          type: array
+          items: { type: string }
+        limit: { type: integer, minimum: 1, maximum: 50, default: 20 }
+
+    MatchesResponse:
+      type: object
+      required: [items, inventory_size, allergens_applied]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Match" }
+        inventory_size:
+          type: integer
+          description: Fridge plus staples, echoed so an empty result is explainable.
+        allergens_applied:
+          type: array
+          items: { type: string }
+
+    Match:
+      type: object
+      required:
+        [recipe_id, title, num_steps, num_ingredients, total_count,
+         missing_count, use_soon_count, have, missing]
+      properties:
+        recipe_id: { type: integer, format: int64 }
+        title: { type: string }
+        category: { type: string }
+        subcategory: { type: string }
+        description: { type: string }
+        num_steps: { type: integer }
+        num_ingredients: { type: integer }
+        total_count:
+          type: integer
+          description: Ingredient lines resolved to catalog ids for this recipe.
+        missing_count: { type: integer }
+        use_soon_count:
+          type: integer
+          description: How many near-expiry fridge items this recipe uses up.
+        have:
+          type: array
+          items: { $ref: "#/components/schemas/RecipeIngredient" }
+        missing:
+          type: array
+          items: { $ref: "#/components/schemas/RecipeIngredient" }
+
+    RecipeIngredient:
+      type: object
+      required: [ingredient_id, canonical_name]
+      properties:
+        ingredient_id: { type: integer, format: int64 }
+        canonical_name: { type: string }
+        qty: { type: number }
+        unit: { type: string }
+
+    AdaptRequest:
+      type: object
+      properties:
+        recipe_id:
+          type: integer
+          format: int64
+          description: |
+            Must be one of your matches. Omit to let the model choose among the
+            top five.
+        servings: { type: integer, minimum: 1, maximum: 12 }
+        notes:
+          type: string
+          maxLength: 500
+          description: |
+            Free-text guidance ("make it spicier"), passed to the model as a hint
+            alongside diets and cuisines. Not echoed back in the result.
+
+    JobStatus:
+      type: string
+      enum: [queued, running, done, failed]
+
+    Job:
+      type: object
+      required: [job_id, status, recipe_id, created_at, updated_at, attempts]
+      properties:
+        job_id: { type: string, format: uuid }
+        recipe_id: { type: integer, format: int64 }
+        status: { $ref: "#/components/schemas/JobStatus" }
+        attempts:
+          type: integer
+          description: Model attempts made so far, including validator rejections.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        result: { $ref: "#/components/schemas/AdaptedResult" }
+        error:
+          type: string
+          description: Present when status is failed. Safe to show to the user.
+
+    AdaptedResult:
+      type: object
+      required:
+        [id, base_recipe_id, title, adapted, used_ingredients,
+         missing_ingredients, substitutions, steps, base_recipe]
+      properties:
+        id: { type: string, format: uuid }
+        base_recipe_id: { type: integer, format: int64 }
+        title: { type: string }
+        servings:
+          type: integer
+          description: Echoes the requested servings; the model does not report it.
+        adapted:
+          type: boolean
+          description: |
+            False when every model attempt was rejected by validation and the
+            retrieved recipe is returned as-is. In that case `steps` is empty,
+            because verbatim corpus directions are never published.
+        fallback_reason: { type: string }
+        used_ingredients:
+          type: array
+          description: |
+            Recomputed from the catalog, not trusted from the model. Quantities
+            come from the corpus recipe row, because the model returns bare names.
+          items: { $ref: "#/components/schemas/RecipeIngredient" }
+        missing_ingredients:
+          type: array
+          items: { $ref: "#/components/schemas/RecipeIngredient" }
+        substitutions:
+          type: array
+          items:
+            type: object
+            required: [original, replacement]
+            properties:
+              original: { type: string }
+              replacement: { type: string }
+              reason: { type: string }
+        steps:
+          type: array
+          description: Model-paraphrased steps. Never verbatim corpus directions.
+          items: { type: string }
+        model: { type: string }
+        warnings:
+          type: array
+          description: Non-fatal notes, e.g. ingredients absent from the catalog.
+          items: { type: string }
+        base_recipe: { $ref: "#/components/schemas/CorpusRecipe" }
+
+    CorpusRecipe:
+      type: object
+      description: Corpus metadata. Deliberately has no directions field.
+      required: [id, title, num_ingredients, num_steps]
+      properties:
+        id: { type: integer, format: int64 }
+        title: { type: string }
+        category: { type: string }
+        subcategory: { type: string }
+        description: { type: string }
+        num_ingredients: { type: integer }
+        num_steps: { type: integer }
+        source: { type: string }
+
+    HistoryItem:
+      type: object
+      required: [id, base_recipe_id, result, adapted, created_at, base_title]
+      properties:
+        id: { type: string, format: uuid }
+        base_recipe_id: { type: integer, format: int64 }
+        base_title: { type: string }
+        result: { $ref: "#/components/schemas/AdaptedResult" }
+        model: { type: string }
+        adapted: { type: boolean }
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        created_at: { type: string, format: date-time }

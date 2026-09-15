@@ -1,0 +1,92 @@
+# This service is self-contained: `docker compose up` here brings up core-api
+# with its own Postgres and Redis. It joins the external `recipe-net` network so
+# the sibling services can reach it by name.
+#
+#   docker network create recipe-net   # once, see the root plan
+name: recipe-core
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: recipes
+      POSTGRES_USER: recipes
+      POSTGRES_PASSWORD: recipes
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recipes"]
+      interval: 5s
+      retries: 10
+    networks: [recipe-net]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+    networks: [recipe-net]
+
+  # Runs to completion before core-api starts, so the app never races the schema.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.migrate
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [recipe-net]
+
+  core-api:
+    build:
+      context: .
+      target: dev
+    env_file: .env
+    ports: ["8080:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./:/app
+      # Keep the module cache and air's build output out of the bind mount.
+      - gomodcache:/go/pkg/mod
+      - apitmp:/app/tmp
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+    networks: [recipe-net]
+
+  # One-off corpus load: docker compose --profile ingest run --rm ingest
+  ingest:
+    profiles: ["ingest"]
+    build:
+      context: ./tools/ingest
+    env_file: .env
+    volumes:
+      - ./data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [recipe-net]
+
+volumes:
+  pgdata:
+  gomodcache:
+  apitmp:
+
+networks:
+  recipe-net:
+    external: true

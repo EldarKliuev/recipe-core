@@ -1,0 +1,12 @@
+.env
+tmp/
+data/
+*.log
+.DS_Store
+.idea/
+
+# Python ingest tool
+tools/ingest/.venv/
+tools/ingest/__pycache__/
+**/__pycache__/
+*.pyc
