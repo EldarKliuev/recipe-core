@@ -157,7 +157,8 @@ func (w *Worker) run(ctx context.Context, log *slog.Logger, t task) {
 
 	// lastReason is a complete phrase, not a fragment: the fallback message shown
 	// to the user must describe what actually happened on the final attempt,
-	// which may be a rejection or a failed call.
+	// which may be a rejection or a failed call. It reaches the client, so upstream
+	// error text stays out of it and goes to the log and generation_runs instead.
 	var lastReason string
 	attempts := 0
 	for attempt := 1; attempt <= w.maxTries; attempt++ {
@@ -195,7 +196,7 @@ func (w *Worker) run(ctx context.Context, log *slog.Logger, t task) {
 					"llm-service could not produce a usable answer for this recipe")
 				return
 			}
-			lastReason = fmt.Sprintf("the adaptation call failed (%v)", err)
+			lastReason = "the adaptation call failed"
 			log.Warn("adaptation call failed", slog.Int("attempt", attempt), slog.Any("error", err))
 			continue
 		}

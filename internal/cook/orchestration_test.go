@@ -349,6 +349,36 @@ func TestWorkerRetriesRejectionsThenFallsBackWithAnAccurateReason(t *testing.T) 
 	}
 }
 
+// fallback_reason reaches the client, so an upstream error body must stay in the
+// logs and generation_runs instead.
+func TestWorkerFallbackReasonDoesNotExposeUpstreamErrors(t *testing.T) {
+	const upstreamDetail = "llm-service returned 500: traceback in /app/usecases/adapt.py"
+	upstream := errors.New(upstreamDetail)
+
+	h := newHarness(t, []llmReply{{err: upstream}, {err: upstream}}, 2)
+
+	job := h.runJob(t, user.Prefs{})
+
+	if job.Status != JobDone || job.Result == nil || job.Result.Adapted {
+		t.Fatalf("job = %+v, want an unadapted fallback", job)
+	}
+	reason := job.Result.FallbackReason
+	if strings.Contains(reason, "traceback") || strings.Contains(reason, "500") {
+		t.Errorf("FallbackReason = %q, must not contain the upstream error", reason)
+	}
+	if !strings.Contains(reason, "all 2 attempts") {
+		t.Errorf("FallbackReason = %q, want it to report the 2 attempts actually made", reason)
+	}
+	if len(h.store.runs) != 2 {
+		t.Fatalf("runs = %d, want one recorded per failed attempt", len(h.store.runs))
+	}
+	for _, run := range h.store.runs {
+		if run.Error != upstreamDetail {
+			t.Errorf("run error = %q, want the upstream detail kept for diagnosis", run.Error)
+		}
+	}
+}
+
 // A first-attempt rejection followed by a good answer must end adapted: the
 // retry exists precisely so one bad sample does not cost the user their result.
 func TestWorkerAcceptsAnAnswerAfterAnEarlierRejection(t *testing.T) {
