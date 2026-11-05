@@ -3,6 +3,7 @@ package cook
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -139,8 +140,15 @@ func (h *Handler) job(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.svc.StreamJob(r.Context(), userID, jobID, emit); err != nil {
+		// A client that went away surfaces here too, and there is nobody to tell.
+		if r.Context().Err() != nil {
+			return
+		}
+		slog.ErrorContext(r.Context(), "job stream failed",
+			slog.String("job_id", jobID.String()),
+			slog.Any("error", err))
 		// Headers are already sent, so report the failure inside the stream.
-		_, _ = fmt.Fprintf(w, "event: error\ndata: {\"message\":%q}\n\n", err.Error())
+		_, _ = fmt.Fprint(w, "event: error\ndata: {\"message\":\"could not read the job status\"}\n\n")
 		flusher.Flush()
 	}
 }
