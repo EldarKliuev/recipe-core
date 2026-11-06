@@ -349,6 +349,35 @@ func TestWorkerRetriesRejectionsThenFallsBackWithAnAccurateReason(t *testing.T) 
 	}
 }
 
+// A name outside the catalog cannot be checked against the user's allergens, so it
+// takes the rejection path: retried, then served as an unadapted fallback.
+func TestWorkerFallsBackWhenAnUnverifiableNameMeetsADenyList(t *testing.T) {
+	unknown := goodResponse()
+	unknown.Recipe.UsedIngredients = append(unknown.Recipe.UsedIngredients, "shrimp paste")
+
+	h := newHarness(t, []llmReply{{resp: unknown}, {resp: unknown}}, 2)
+
+	job := h.runJob(t, user.Prefs{Allergens: []string{"shellfish"}})
+
+	if job.Status != JobDone {
+		t.Fatalf("Status = %q, want %q", job.Status, JobDone)
+	}
+	if job.Result == nil || job.Result.Adapted {
+		t.Fatalf("Result = %+v, want an unadapted fallback", job.Result)
+	}
+	if strings.Contains(job.Result.FallbackReason, "shrimp paste") {
+		t.Errorf("FallbackReason = %q, want the model's words kept out of it", job.Result.FallbackReason)
+	}
+	if h.llm.calls != 2 {
+		t.Errorf("llm calls = %d, want maxTries=2", h.llm.calls)
+	}
+	for _, run := range h.store.runs {
+		if run.Status != recipehistory.RunRejected {
+			t.Errorf("run status = %q, want %q", run.Status, recipehistory.RunRejected)
+		}
+	}
+}
+
 // fallback_reason reaches the client, so an upstream error body must stay in the
 // logs and generation_runs instead.
 func TestWorkerFallbackReasonDoesNotExposeUpstreamErrors(t *testing.T) {
