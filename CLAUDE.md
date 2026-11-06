@@ -114,7 +114,7 @@ git fetch origin main -q && git diff --name-only origin/main...HEAD
   3. Воркер вызывает `llm-service` и пропускает ответ через `Validator`.
   4. `GET /cook/jobs/{id}` отдаёт статусы через SSE (Redis pub/sub плюс редкий опрос) с обычным заголовком `Authorization`. Из-за этого стрима у `http.Server` нет `WriteTimeout`.
 
-**Окружение:** `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET` (минимум 32 байта), `JWT_ACCESS_TTL`, `JWT_REFRESH_TTL`, `LLM_SERVICE_URL`, `LLM_SERVICE_TIMEOUT_SEC=180`, `ADAPT_WORKERS=2`, `ADAPT_QUEUE_SIZE=64`, `JOB_TTL=1h`, `HTTP_PORT=8080`, `LOG_LEVEL`, `CORS_ALLOWED_ORIGINS`. Число попыток адаптации (2) и лимит авторизации заданы в коде `config.Load`, а не в окружении.
+**Окружение:** `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET` (минимум 32 байта), `JWT_ACCESS_TTL`, `JWT_REFRESH_TTL`, `LLM_SERVICE_URL`, `LLM_SERVICE_TIMEOUT_SEC=180`, `ADAPT_WORKERS=2`, `ADAPT_QUEUE_SIZE=64`, `JOB_TTL=1h`, `HTTP_PORT=8080`, `LOG_LEVEL`, `CORS_ALLOWED_ORIGINS`. Число попыток адаптации (2) и лимит авторизации заданы в коде `config.Load`, а не в окружении. Контейнеру `core-api` адрес `LLM_SERVICE_URL` задаёт `docker-compose.yml`, значение из `.env` на него не влияет.
 
 **Команды** (`make help` покажет все):
 

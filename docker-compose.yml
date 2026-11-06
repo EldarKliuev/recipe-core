@@ -46,6 +46,11 @@ services:
       context: .
       target: dev
     env_file: .env
+    # Inside the container localhost is the container itself, so the address must not
+    # depend on .env, and environment beats env_file. /readyz would not reveal a wrong
+    # address: it deliberately does not check llm-service.
+    environment:
+      LLM_SERVICE_URL: http://llm-service:9000
     ports: ["8080:8080"]
     depends_on:
       postgres:
