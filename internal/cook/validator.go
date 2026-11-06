@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/recipe-ai/core-api/internal/catalog"
 )
@@ -19,6 +20,7 @@ const (
 	RejectAllergen      RejectionReason = "allergen_violation"
 	RejectNoSteps       RejectionReason = "empty_steps"
 	RejectUnknownRecipe RejectionReason = "unknown_base_recipe"
+	RejectUnverifiable  RejectionReason = "unverifiable_ingredient"
 )
 
 // Rejection is returned when the model output is semantically invalid. It is a
@@ -82,8 +84,11 @@ type ValidationInput struct {
 //   - every ingredient is normalised against the catalog, and anything not in
 //     the fridge or staples is moved into missing[] regardless of which bucket
 //     the model put it in;
+//   - lines of the base recipe the user lacks are added to missing[] when the steps
+//     mention them, even if the model did not list them, unless it replaced them;
 //   - any ingredient or substitution replacement carrying a denied allergen tag
-//     rejects the whole answer;
+//     rejects the whole answer, and so does a name outside the catalog while a
+//     deny-list is in force, because its allergens cannot be checked;
 //   - an answer with no steps is useless and is rejected.
 func (v *Validator) Validate(ctx context.Context, in ValidationInput, out LLMAdaptedRecipe) (Result, error) {
 	if !slices.Contains(in.CandidateIDs, out.BaseRecipeID) {
@@ -132,25 +137,46 @@ func (v *Validator) Validate(ctx context.Context, in ValidationInput, out LLMAda
 	}
 
 	byName := make(map[string]catalog.Ingredient, len(resolved))
-	ids := make([]int64, 0, len(resolved))
+	checked := make([]Ingredient, 0, len(resolved))
 	for _, res := range resolved {
 		byName[strings.ToLower(res.Input)] = res.Ingredient
-		ids = append(ids, res.Ingredient.ID)
+		checked = append(checked, Ingredient{IngredientID: res.Ingredient.ID, CanonicalName: res.Ingredient.CanonicalName})
+	}
+
+	baseLines, err := v.linesStillNeeded(ctx, in.BaseLines[out.BaseRecipeID], substitutions)
+	if err != nil {
+		return Result{}, err
+	}
+	for _, line := range baseLines {
+		checked = append(checked, Ingredient{IngredientID: line.IngredientID, CanonicalName: line.CanonicalName})
 	}
 
 	if len(in.DenyAllergens) > 0 {
+		ids := make([]int64, 0, len(checked))
+		for _, ing := range checked {
+			ids = append(ids, ing.IngredientID)
+		}
 		allergens, err := v.catalog.AllergensForIngredients(ctx, ids)
 		if err != nil {
 			return Result{}, err
 		}
-		for _, res := range resolved {
-			for _, tag := range allergens[res.Ingredient.ID] {
+		for _, ing := range checked {
+			for _, tag := range allergens[ing.IngredientID] {
 				if slices.Contains(in.DenyAllergens, tag) {
 					return Result{}, &Rejection{
 						Reason: RejectAllergen,
-						Detail: fmt.Sprintf("%q carries denied allergen %q", res.Ingredient.CanonicalName, tag),
+						Detail: fmt.Sprintf("%q carries denied allergen %q", ing.CanonicalName, tag),
 					}
 				}
+			}
+		}
+		// Allergens are compared by canonical id only, so a name without one cannot
+		// be cleared. Matching its text against allergen words would let a spelling
+		// difference through.
+		if len(unresolved) > 0 {
+			return Result{}, &Rejection{
+				Reason: RejectUnverifiable,
+				Detail: fmt.Sprintf("cannot check allergens of names outside the catalog: %s", strings.Join(unresolved, ", ")),
 			}
 		}
 	}
@@ -201,8 +227,39 @@ func (v *Validator) Validate(ctx context.Context, in ValidationInput, out LLMAda
 		}
 	}
 
-	// Ingredients the model invented that do not exist in the catalog cannot be
-	// verified, so they are reported rather than silently kept.
+	// The prompt asks the model to list everything its steps rely on, but a line it
+	// forgot would otherwise surface only mid-cooking. A line the steps never mention
+	// stays out: the model often drops one without recording a substitution, and
+	// telling the user to buy fish for a chicken dish is plainly wrong. This match is
+	// about the shopping list only; allergens are checked by id above, for every line.
+	stepWords := make(map[string]struct{})
+	for _, step := range result.Steps {
+		for _, word := range splitWords(step) {
+			stepWords[word] = struct{}{}
+		}
+	}
+	for _, line := range baseLines {
+		if _, dup := seen[line.IngredientID]; dup {
+			continue
+		}
+		seen[line.IngredientID] = struct{}{}
+		if _, inFridge := have[line.IngredientID]; inFridge {
+			continue
+		}
+		if !mentions(stepWords, line.CanonicalName) {
+			continue
+		}
+		result.Missing = append(result.Missing, Ingredient{
+			IngredientID:  line.IngredientID,
+			CanonicalName: line.CanonicalName,
+			Qty:           line.Qty,
+			Unit:          line.Unit,
+		})
+	}
+
+	// Without a deny-list a name outside the catalog is harmless to keep, so it is
+	// reported rather than silently kept. RecipeIngredient requires an id, which
+	// such a name does not have, so it cannot be listed in missing[].
 	if len(unresolved) > 0 {
 		result.Warnings = append(result.Warnings,
 			fmt.Sprintf("could not match to the ingredient catalog: %s", strings.Join(unresolved, ", ")))
@@ -216,6 +273,58 @@ func (v *Validator) Validate(ctx context.Context, in ValidationInput, out LLMAda
 		})
 	}
 	return result, nil
+}
+
+// linesStillNeeded drops the base lines the model explicitly replaced: telling the
+// user to buy what was just swapped out would be wrong. The name being replaced is
+// only used to find the line, so it not resolving is not an error.
+func (v *Validator) linesStillNeeded(ctx context.Context, lines []catalog.RecipeIngredient, subs []LLMSubstitution) ([]catalog.RecipeIngredient, error) {
+	originals := make([]string, 0, len(subs))
+	for _, sub := range subs {
+		originals = append(originals, strings.TrimSpace(sub.Missing))
+	}
+	resolved, _, err := v.catalog.ResolveNames(ctx, originals)
+	if err != nil {
+		return nil, err
+	}
+	replaced := make(map[int64]struct{}, len(resolved))
+	for _, res := range resolved {
+		replaced[res.Ingredient.ID] = struct{}{}
+	}
+
+	needed := make([]catalog.RecipeIngredient, 0, len(lines))
+	for _, line := range lines {
+		if _, ok := replaced[line.IngredientID]; !ok {
+			needed = append(needed, line)
+		}
+	}
+	return needed, nil
+}
+
+// mentions reports whether every word of an ingredient name occurs in words, as a
+// whole word and ignoring a plural ending. Requiring all of them keeps "chicken
+// fillet" in the steps from counting as "salmon fillet".
+func mentions(words map[string]struct{}, name string) bool {
+	parts := splitWords(name)
+	for _, part := range parts {
+		found := false
+		for _, form := range []string{part, part + "s", part + "es", strings.TrimSuffix(part, "s"), strings.TrimSuffix(part, "es")} {
+			if _, ok := words[form]; ok {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return len(parts) > 0
+}
+
+func splitWords(text string) []string {
+	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
 }
 
 func nonEmpty(in []string) []string {

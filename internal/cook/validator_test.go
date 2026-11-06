@@ -359,6 +359,238 @@ func TestValidateReportsIngredientsAbsentFromTheCatalog(t *testing.T) {
 	}
 }
 
+// A name outside the catalog has no id, so its allergens cannot be checked. With a
+// deny-list in force that is a rejection, not a warning.
+func TestValidateRejectsUnresolvedNameWhenAllergensAreDenied(t *testing.T) {
+	cases := map[string]LLMAdaptedRecipe{
+		"in used": {
+			BaseRecipeID:    100,
+			UsedIngredients: []string{"rice", "shrimp paste"},
+			Steps:           []string{"Cook the rice."},
+		},
+		"in missing": {
+			BaseRecipeID:       100,
+			UsedIngredients:    []string{"rice"},
+			MissingIngredients: []string{"shrimp paste"},
+			Steps:              []string{"Cook the rice."},
+		},
+		"in a substitution replacement": {
+			BaseRecipeID:    100,
+			UsedIngredients: []string{"rice"},
+			Substitutions:   []LLMSubstitution{{Missing: "soy sauce", ReplaceWith: "shrimp paste"}},
+			Steps:           []string{"Cook the rice."},
+		},
+	}
+	for name, out := range cases {
+		t.Run(name, func(t *testing.T) {
+			v, in := testValidator()
+			in.DenyAllergens = []string{"shellfish"}
+
+			_, err := v.Validate(context.Background(), in, out)
+			rej, ok := AsRejection(err)
+			if !ok {
+				t.Fatalf("Validate() error = %v, want a rejection", err)
+			}
+			if rej.Reason != RejectUnverifiable {
+				t.Errorf("reason = %q, want %q", rej.Reason, RejectUnverifiable)
+			}
+			if !strings.Contains(rej.Detail, "shrimp paste") {
+				t.Errorf("detail = %q, want it to name the unknown ingredient", rej.Detail)
+			}
+		})
+	}
+}
+
+// The name being replaced is not advice, so it not resolving must not cost the
+// answer a rejection: it is the replacement that the user would act on.
+func TestValidateAcceptsUnresolvedSubstitutionOriginalWhenAllergensAreDenied(t *testing.T) {
+	v, in := testValidator()
+	in.DenyAllergens = []string{"dairy"}
+
+	got, err := v.Validate(context.Background(), in, LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Substitutions:   []LLMSubstitution{{Missing: "feta", ReplaceWith: "chicken breast"}},
+		Steps:           []string{"Cook the rice."},
+	})
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if len(got.Warnings) != 0 {
+		t.Errorf("Warnings = %v, want none for the name being replaced", got.Warnings)
+	}
+}
+
+// A base line the steps use is still something the user lacks, even if the model
+// forgot to list it.
+func TestValidateAddsBaseLinesTheStepsUseToMissing(t *testing.T) {
+	v, in := testValidator()
+	cup := "cup"
+	three := 3.0
+	in.BaseLines[100] = append(in.BaseLines[100],
+		catalog.RecipeIngredient{IngredientID: 3, CanonicalName: "soy sauce", Qty: &three, Unit: &cup})
+
+	got, err := v.Validate(context.Background(), in, LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Steps:           []string{"Cook the rice.", "Sear the chicken breast with soy sauce."},
+	})
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if len(got.Missing) != 1 || got.Missing[0].CanonicalName != "soy sauce" {
+		t.Fatalf("Missing = %v, want only soy sauce", names(got.Missing))
+	}
+	if got.Missing[0].Qty == nil || *got.Missing[0].Qty != 3 || got.Missing[0].Unit == nil || *got.Missing[0].Unit != "cup" {
+		t.Errorf("soy sauce = %+v, want the corpus amount", got.Missing[0])
+	}
+	// The steps use chicken breast too, but the user has it, and only what the model
+	// named is reported as used.
+	if names := names(got.Used); !equal(names, []string{"rice"}) {
+		t.Errorf("Used = %v, want only rice", names)
+	}
+}
+
+// A line the model named as missing appears once, not again as a base line.
+func TestValidateDoesNotDuplicateBaseLinesTheModelListed(t *testing.T) {
+	v, in := testValidator()
+	in.BaseLines[100] = append(in.BaseLines[100],
+		catalog.RecipeIngredient{IngredientID: 3, CanonicalName: "soy sauce"})
+
+	got, err := v.Validate(context.Background(), in, LLMAdaptedRecipe{
+		BaseRecipeID:       100,
+		MissingIngredients: []string{"soy sauce"},
+		Steps:              []string{"Add the soy sauce."},
+	})
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if names := names(got.Missing); !equal(names, []string{"soy sauce"}) {
+		t.Errorf("Missing = %v, want soy sauce exactly once", names)
+	}
+}
+
+// The model often drops a line without recording a substitution. Asking the user
+// to buy something the steps never use would be wrong.
+func TestValidateLeavesBaseLinesTheStepsDoNotUseOutOfMissing(t *testing.T) {
+	cases := map[string]struct {
+		line  string
+		steps string
+		want  bool
+	}{
+		"absent":                  {"salmon fillet", "Cook the rice.", false},
+		"only one word of a name": {"salmon fillet", "Sear the chicken fillet.", false},
+		"inside a longer word":    {"lime", "Add the slime.", false},
+		"every word present":      {"salmon fillet", "Sear the salmon fillet.", true},
+		"different case":          {"salmon fillet", "SALMON FILLET goes in first.", true},
+		"plural in the steps":     {"tomato", "Chop the tomatoes.", true},
+		"plural in the catalog":   {"kidney beans", "Add the kidney bean.", true},
+		"next to punctuation":     {"lime", "Squeeze (one lime), then serve.", true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			v, in := testValidator()
+			in.BaseLines[100] = append(in.BaseLines[100],
+				catalog.RecipeIngredient{IngredientID: 9, CanonicalName: tc.line})
+
+			got, err := v.Validate(context.Background(), in, LLMAdaptedRecipe{
+				BaseRecipeID:    100,
+				UsedIngredients: []string{"rice"},
+				Steps:           []string{tc.steps},
+			})
+			if err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+			if added := len(got.Missing) == 1; added != tc.want {
+				t.Errorf("Missing = %v, want line added = %v", names(got.Missing), tc.want)
+			}
+		})
+	}
+}
+
+// Telling the user to buy what the model just swapped out would be wrong.
+func TestValidateLeavesReplacedBaseLinesOutOfMissing(t *testing.T) {
+	v, in := testValidator()
+	in.BaseLines[100] = append(in.BaseLines[100],
+		catalog.RecipeIngredient{IngredientID: 3, CanonicalName: "soy sauce"})
+
+	got, err := v.Validate(context.Background(), in, LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Substitutions:   []LLMSubstitution{{Missing: "Soy Sauce", ReplaceWith: "salt"}},
+		Steps:           []string{"Use salt instead of the soy sauce."},
+	})
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if len(got.Missing) != 0 {
+		t.Errorf("Missing = %v, want the replaced soy sauce left out", names(got.Missing))
+	}
+}
+
+// Only the base recipe the model chose counts, not the other candidates.
+func TestValidateIgnoresBaseLinesOfOtherCandidates(t *testing.T) {
+	v, in := testValidator()
+	in.BaseLines[101] = []catalog.RecipeIngredient{{IngredientID: 4, CanonicalName: "butter"}}
+
+	got, err := v.Validate(context.Background(), in, LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Steps:           []string{"Melt the butter over the rice."},
+	})
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if len(got.Missing) != 0 {
+		t.Errorf("Missing = %v, want nothing from another candidate", names(got.Missing))
+	}
+}
+
+// A denied allergen in a base line rejects the answer whether or not the steps
+// mention it: retrieval should have kept the recipe out, and word matching decides
+// only the shopping list, never the allergen check.
+func TestValidateRejectsDeniedAllergenInAnUnmentionedBaseLine(t *testing.T) {
+	v, in := testValidator()
+	in.DenyAllergens = []string{"dairy"}
+	in.BaseLines[100] = append(in.BaseLines[100],
+		catalog.RecipeIngredient{IngredientID: 4, CanonicalName: "butter"})
+
+	_, err := v.Validate(context.Background(), in, LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Steps:           []string{"Cook the rice."},
+	})
+	rej, ok := AsRejection(err)
+	if !ok {
+		t.Fatalf("Validate() error = %v, want a rejection", err)
+	}
+	if rej.Reason != RejectAllergen || !strings.Contains(rej.Detail, "butter") {
+		t.Errorf("rejection = %+v, want an allergen rejection naming butter", rej)
+	}
+}
+
+// Replacing the base line is how the model removes the allergen, so that line no
+// longer counts against the answer.
+func TestValidateAcceptsDeniedBaseLineThatWasReplaced(t *testing.T) {
+	v, in := testValidator()
+	in.DenyAllergens = []string{"dairy"}
+	in.BaseLines[100] = append(in.BaseLines[100],
+		catalog.RecipeIngredient{IngredientID: 4, CanonicalName: "butter"})
+
+	got, err := v.Validate(context.Background(), in, LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Substitutions:   []LLMSubstitution{{Missing: "butter", ReplaceWith: "salt"}},
+		Steps:           []string{"Cook the rice."},
+	})
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if len(got.Missing) != 0 {
+		t.Errorf("Missing = %v, want the replaced butter left out", names(got.Missing))
+	}
+}
+
 func TestValidateFallsBackToCorpusTitle(t *testing.T) {
 	v, in := testValidator()
 

@@ -689,6 +689,10 @@ components:
           items: { $ref: "#/components/schemas/RecipeIngredient" }
         missing_ingredients:
           type: array
+          description: |
+            What the user lacks: recomputed from the catalog, plus lines of the base
+            recipe that the steps mention but the model did not list, unless it
+            replaced them.
           items: { $ref: "#/components/schemas/RecipeIngredient" }
         substitutions:
           type: array
@@ -706,7 +710,11 @@ components:
         model: { type: string }
         warnings:
           type: array
-          description: Non-fatal notes, e.g. ingredients absent from the catalog.
+          description: |
+            Non-fatal notes, e.g. ingredients absent from the catalog. Such a name has
+            no ingredient_id, so it appears here and not in missing_ingredients. It
+            occurs only for users with no denied allergens: with a deny-list the answer
+            is rejected instead, because the name cannot be checked.
           items: { type: string }
         base_recipe: { $ref: "#/components/schemas/CorpusRecipe" }
 
