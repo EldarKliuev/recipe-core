@@ -126,6 +126,50 @@ func (r *Repo) ResolveNames(ctx context.Context, names []string) (resolved []Res
 // trigram overlap would silently corrupt someone's fridge.
 const fuzzyThreshold = 0.55
 
+// pluralExceptions mirrors _PLURAL_EXCEPTIONS in tools/ingest/ingest/parser.py.
+var pluralExceptions = map[string]string{
+	"leaves": "leaf", "loaves": "loaf", "halves": "half", "knives": "knife",
+	"tomatoes": "tomato", "potatoes": "potato", "berries": "berry",
+	"cherries": "cherry", "strawberries": "strawberry",
+	"blueberries": "blueberry", "raspberries": "raspberry",
+	"cranberries": "cranberry", "anchovies": "anchovy",
+	"molasses": "molasses", "asparagus": "asparagus", "hummus": "hummus",
+	"couscous": "couscous", "swiss": "swiss", "bass": "bass",
+	"watercress": "watercress", "grits": "grits", "greens": "greens",
+	"oats": "oats", "chives": "chives", "capers": "capers", "peas": "peas",
+	"beans": "beans", "lentils": "lentils", "noodles": "noodles",
+	"sprouts": "sprouts", "grapes": "grapes", "raisins": "raisins",
+	"breadcrumbs": "breadcrumbs", "cloves": "clove",
+}
+
+// singularName applies the rule ingest used to build canonical names, so a plural
+// reaches the entry its corpus lines were linked to. It mirrors singularise in
+// tools/ingest/ingest/parser.py, including its odd results: "peaches" becomes
+// "peache" because that is the name in the catalog.
+func singularName(name string) string {
+	words := strings.Fields(name)
+	for i, word := range words {
+		words[i] = singularWord(word)
+	}
+	return strings.Join(words, " ")
+}
+
+func singularWord(word string) string {
+	if singular, ok := pluralExceptions[word]; ok {
+		return singular
+	}
+	if len(word) <= 3 {
+		return word
+	}
+	if strings.HasSuffix(word, "ies") {
+		return strings.TrimSuffix(word, "ies") + "y"
+	}
+	if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") {
+		return strings.TrimSuffix(word, "s")
+	}
+	return word
+}
+
 func (r *Repo) resolveOne(ctx context.Context, name string) (Resolution, bool, error) {
 	q := strings.ToLower(strings.TrimSpace(name))
 	if q == "" {
@@ -143,21 +187,26 @@ WITH candidate AS (
     SELECT s.ingredient_id, 1, 1.0
     FROM ingredient_synonyms s WHERE lower(s.synonym) = $1
     UNION ALL
-    SELECT c.id, 2, similarity(lower(c.canonical_name), $1)
+    -- Canonical names only: some synonyms drop an allergen, and the singular must
+    -- not become another way to reach them.
+    SELECT c.id, 2, 1.0
+    FROM ingredients_catalog c WHERE lower(c.canonical_name) = $3
+    UNION ALL
+    SELECT c.id, 3, similarity(lower(c.canonical_name), $1)
     FROM ingredients_catalog c
     WHERE similarity(lower(c.canonical_name), $1) >= $2
 )
 SELECT c.id, c.canonical_name, c.category,
-       coalesce(array_agg(a.allergen) FILTER (WHERE a.allergen IS NOT NULL), '{}'),
+       coalesce(array_agg(DISTINCT a.allergen) FILTER (WHERE a.allergen IS NOT NULL), '{}'),
        (st.ingredient_id IS NOT NULL),
-       (min(cand.rank) < 2)
+       (min(cand.rank) < 3)
 FROM candidate cand
 JOIN ingredients_catalog c ON c.id = cand.id
 LEFT JOIN ingredient_allergens a ON a.ingredient_id = c.id
 LEFT JOIN pantry_staples st ON st.ingredient_id = c.id
 GROUP BY c.id, c.canonical_name, c.category, st.ingredient_id
 ORDER BY min(cand.rank), max(cand.sim) DESC, length(c.canonical_name)
-LIMIT 1`, q, fuzzyThreshold).
+LIMIT 1`, q, fuzzyThreshold, singularName(q)).
 		Scan(&ing.ID, &ing.CanonicalName, &ing.Category, &ing.Allergens, &ing.IsStaple, &exact)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Resolution{}, false, nil

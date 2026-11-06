@@ -43,6 +43,6 @@ type Resolution struct {
 	Input      string
 	Ingredient Ingredient
 	// Exact is false when the match came from trigram similarity rather than a
-	// canonical name or a registered synonym.
+	// canonical name, its plural or a registered synonym.
 	Exact bool
 }
