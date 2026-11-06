@@ -82,7 +82,8 @@ type ValidationInput struct {
 //   - every ingredient is normalised against the catalog, and anything not in
 //     the fridge or staples is moved into missing[] regardless of which bucket
 //     the model put it in;
-//   - any ingredient carrying a denied allergen tag rejects the whole answer;
+//   - any ingredient or substitution replacement carrying a denied allergen tag
+//     rejects the whole answer;
 //   - an answer with no steps is useless and is rejected.
 func (v *Validator) Validate(ctx context.Context, in ValidationInput, out LLMAdaptedRecipe) (Result, error) {
 	if !slices.Contains(in.CandidateIDs, out.BaseRecipeID) {
@@ -110,6 +111,19 @@ func (v *Validator) Validate(ctx context.Context, in ValidationInput, out LLMAda
 		if name := strings.TrimSpace(item); name != "" {
 			names = append(names, name)
 		}
+	}
+
+	// A replacement is advice the user may act on, so it is checked like any other
+	// ingredient. The ingredient being replaced is not: swapping an allergen out is
+	// exactly what the user needs. Incomplete pairs are never shown, so they are
+	// dropped here and cannot reject the answer.
+	substitutions := make([]LLMSubstitution, 0, len(out.Substitutions))
+	for _, sub := range out.Substitutions {
+		if strings.TrimSpace(sub.Missing) == "" || strings.TrimSpace(sub.ReplaceWith) == "" {
+			continue
+		}
+		substitutions = append(substitutions, sub)
+		names = append(names, strings.TrimSpace(sub.ReplaceWith))
 	}
 
 	resolved, unresolved, err := v.catalog.ResolveNames(ctx, names)
@@ -194,10 +208,7 @@ func (v *Validator) Validate(ctx context.Context, in ValidationInput, out LLMAda
 			fmt.Sprintf("could not match to the ingredient catalog: %s", strings.Join(unresolved, ", ")))
 	}
 
-	for _, sub := range out.Substitutions {
-		if strings.TrimSpace(sub.Missing) == "" || strings.TrimSpace(sub.ReplaceWith) == "" {
-			continue
-		}
+	for _, sub := range substitutions {
 		result.Substitutions = append(result.Substitutions, Substitution{
 			Original:    sub.Missing,
 			Replacement: sub.ReplaceWith,

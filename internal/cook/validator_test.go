@@ -215,6 +215,110 @@ func TestValidateRejectsAllergenEvenWhenOnlyListedAsMissing(t *testing.T) {
 	}
 }
 
+// A replacement is advice the user may act on, so a denied allergen in it rejects
+// the answer even though it appears in neither ingredient list.
+func TestValidateRejectsDeniedAllergenInSubstitutionReplacement(t *testing.T) {
+	v, in := testValidator()
+	in.DenyAllergens = []string{"dairy"}
+
+	out := LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Substitutions: []LLMSubstitution{
+			{Missing: "soy sauce", ReplaceWith: "  Butter ", Note: "richer"},
+		},
+		Steps: []string{"Cook the rice."},
+	}
+
+	_, err := v.Validate(context.Background(), in, out)
+	rej, ok := AsRejection(err)
+	if !ok {
+		t.Fatalf("Validate() error = %v, want a rejection", err)
+	}
+	if rej.Reason != RejectAllergen {
+		t.Errorf("reason = %q, want %q", rej.Reason, RejectAllergen)
+	}
+	if !strings.Contains(rej.Detail, "butter") {
+		t.Errorf("detail = %q, want it to name the replacement", rej.Detail)
+	}
+}
+
+// Swapping a denied ingredient for a safe one is the behaviour we want, so only
+// the replacement is checked, never the ingredient being replaced.
+func TestValidateAllowsSubstitutionThatRemovesADeniedAllergen(t *testing.T) {
+	v, in := testValidator()
+	in.DenyAllergens = []string{"dairy"}
+
+	out := LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Substitutions: []LLMSubstitution{
+			{Missing: "butter", ReplaceWith: "chicken breast", Note: "no dairy"},
+		},
+		Steps: []string{"Cook the rice."},
+	}
+
+	got, err := v.Validate(context.Background(), in, out)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	want := Substitution{Original: "butter", Replacement: "chicken breast", Reason: "no dairy"}
+	if len(got.Substitutions) != 1 || got.Substitutions[0] != want {
+		t.Errorf("Substitutions = %+v, want only %+v", got.Substitutions, want)
+	}
+	// A replacement is advice, not a recipe ingredient: the used and missing
+	// lists are still built only from what the model listed there.
+	if names := names(got.Used); !equal(names, []string{"rice"}) {
+		t.Errorf("Used = %v, want only rice", names)
+	}
+	if len(got.Missing) != 0 {
+		t.Errorf("Missing = %v, want none", names(got.Missing))
+	}
+}
+
+// An incomplete substitution never reaches the user, so it must not cost the
+// whole answer a rejection.
+func TestValidateIgnoresDeniedAllergenInADroppedSubstitution(t *testing.T) {
+	v, in := testValidator()
+	in.DenyAllergens = []string{"dairy"}
+
+	out := LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Substitutions:   []LLMSubstitution{{Missing: "  ", ReplaceWith: "butter"}},
+		Steps:           []string{"Cook the rice."},
+	}
+
+	got, err := v.Validate(context.Background(), in, out)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if len(got.Substitutions) != 0 {
+		t.Errorf("Substitutions = %+v, want the incomplete one dropped", got.Substitutions)
+	}
+}
+
+// A replacement outside the catalog cannot be verified, so it is reported the same
+// way as any other unknown name.
+func TestValidateReportsSubstitutionReplacementAbsentFromTheCatalog(t *testing.T) {
+	v, in := testValidator()
+
+	out := LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"rice"},
+		Substitutions:   []LLMSubstitution{{Missing: "soy sauce", ReplaceWith: "unobtainium powder"}},
+		Steps:           []string{"Cook the rice."},
+	}
+
+	got, err := v.Validate(context.Background(), in, out)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if len(got.Warnings) != 1 || !strings.Contains(got.Warnings[0], "unobtainium powder") {
+		t.Errorf("Warnings = %v, want one warning naming the unknown replacement", got.Warnings)
+	}
+}
+
 func TestValidateRejectsEmptySteps(t *testing.T) {
 	v, in := testValidator()
 
