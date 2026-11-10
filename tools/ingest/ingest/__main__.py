@@ -7,8 +7,8 @@ Stages write artefacts into /data/work so any stage can be re-run alone:
     catalog   canonical vocabulary from frequency analysis + synonyms
     sample    200-row sample for the manual review the plan requires
     allergens keyword proposals -> review file
-    load      write everything to Postgres
-    all       parse, catalog, sample, allergens, load
+    load      write everything to Postgres; refuses until the review file is confirmed
+    all       parse, catalog, sample, allergens, load (a fresh run stops at load)
 """
 
 from __future__ import annotations
@@ -332,16 +332,17 @@ def cmd_allergens(_: argparse.Namespace) -> int:
     tagged = 0
     with ALLERGEN_REVIEW.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["canonical_name", "allergens", "occurrences", "confirmed"])
+        writer.writerow(allergen_rules.REVIEW_COLUMNS)
         for name in catalog["canonical"]:
             tags = allergen_rules.tag(name)
             if tags:
                 tagged += 1
-            writer.writerow([name, " ".join(tags), catalog["frequency"].get(name, 0),
-                             "yes" if tags else ""])
+            # `confirmed` starts empty for every row: only a reviewer sets it.
+            writer.writerow([name, " ".join(tags), catalog["frequency"].get(name, 0), ""])
 
     print(f"wrote {ALLERGEN_REVIEW}: {tagged} of {len(catalog['canonical'])} entries tagged")
-    print("Review it before `load`: a missed tag is a safety bug, a spurious one only narrows results.")
+    print("Review every row, fix `allergens` where needed and set `confirmed` to yes.")
+    print("`load` refuses to run until all rows are confirmed: a missed tag is a safety bug.")
     return 0
 
 
@@ -353,6 +354,12 @@ def cmd_load(args: argparse.Namespace) -> int:
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     canonical: list[str] = catalog["canonical"]
     synonyms: dict[str, str] = catalog["synonyms"]
+
+    # Checked before anything is written, so an unreviewed file leaves the database as it was.
+    try:
+        reviewed = allergen_rules.read_review(ALLERGEN_REVIEW, canonical)
+    except allergen_rules.ReviewError as err:
+        raise SystemExit(str(err)) from None
 
     conn = db.connect()
     try:
@@ -374,7 +381,12 @@ def cmd_load(args: argparse.Namespace) -> int:
         db.upsert_staples(conn, staple_ids)
         conn.commit()
 
-        allergen_rows = _confirmed_allergens(name_to_id)
+        allergen_rows = [
+            (name_to_id[name], tag)
+            for name, tags in reviewed.items()
+            if name in name_to_id
+            for tag in tags
+        ]
         print(f"upserting {len(allergen_rows)} allergen tags")
         db.upsert_allergens(conn, allergen_rows)
         conn.commit()
@@ -395,35 +407,6 @@ def cmd_load(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     return 0
-
-
-def _confirmed_allergens(name_to_id: dict[str, int]) -> list[tuple[int, str]]:
-    """Read allergen tags from the review file, honouring the confirmed column."""
-    if not ALLERGEN_REVIEW.exists():
-        print(f"WARNING: {ALLERGEN_REVIEW} missing; falling back to unreviewed keyword rules")
-        return [
-            (ingredient_id, tag)
-            for name, ingredient_id in name_to_id.items()
-            for tag in allergen_rules.tag(name)
-        ]
-
-    rows: list[tuple[int, str]] = []
-    skipped = 0
-    with ALLERGEN_REVIEW.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            tags = (row.get("allergens") or "").split()
-            if not tags:
-                continue
-            if (row.get("confirmed") or "").strip().lower() in {"no", "n", "false"}:
-                skipped += 1
-                continue
-            ingredient_id = name_to_id.get((row.get("canonical_name") or "").strip().lower())
-            if ingredient_id is None:
-                continue
-            rows.extend((ingredient_id, tag) for tag in tags)
-    if skipped:
-        print(f"  skipped {skipped} entries marked not confirmed")
-    return rows
 
 
 def _match_head_noun(name: str, canonical: set[str]) -> str | None:

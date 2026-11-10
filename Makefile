@@ -74,6 +74,10 @@ build: ## Build the binaries locally
 test: ## Run unit tests
 	go test ./...
 
+.PHONY: test-ingest
+test-ingest: ## Run ingest unit tests (allergen rules, review file)
+	cd tools/ingest && python3 -m unittest discover -s tests
+
 .PHONY: test-db
 test-db: ## Create the throwaway integration-test database (idempotent)
 	@docker compose exec -T postgres \
