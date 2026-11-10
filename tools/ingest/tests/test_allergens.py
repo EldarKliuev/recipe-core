@@ -179,5 +179,26 @@ class RecipesLosingAllergensTest(unittest.TestCase):
         self.assertEqual(allergens.recipes_losing_allergens(records, set())[0], 0)
 
 
+class SynonymsLosingAllergensTest(unittest.TestCase):
+    def test_reports_synonyms_whose_target_lacks_their_allergens(self) -> None:
+        synonyms = {
+            "sardine in oil": "oil",
+            "cheese and garlic crouton": "crouton",  # keeps gluten, loses dairy
+            "salted butter": "butter",
+            "granny smith apple": "apple",
+        }
+        self.assertEqual(allergens.synonyms_losing_allergens(synonyms), {
+            "sardine in oil": "oil",
+            "cheese and garlic crouton": "crouton",
+        })
+
+    def test_reviewed_tags_of_the_target_win_over_the_rules(self) -> None:
+        # A reviewer who drops a tag from the target makes the synonym unsafe.
+        synonyms = {"salted butter": "butter", "sardine in oil": "oil"}
+        reviewed = {"butter": (), "oil": ("fish",)}
+        self.assertEqual(allergens.synonyms_losing_allergens(synonyms, reviewed),
+                         {"salted butter": "butter"})
+
+
 if __name__ == "__main__":
     unittest.main()

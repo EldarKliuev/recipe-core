@@ -23,6 +23,13 @@ tag becomes a catalog entry however rare it is (`crab`, `feta`), and `catalog`
 fails if any recipe would still lose a tagged line. `load` repeats the check
 before writing anything.
 
+A synonym hides an allergen the same way: its lines are stored under the
+target's id, so `sardine in oil` mapped onto `oil` would pass a fish deny-list.
+`catalog` maps a rare name onto its head noun only when the target carries every
+tag the name has; otherwise the name is promoted like any other tagged name.
+`catalog` fails if any synonym still loses a tag, and `load` repeats that check
+against the reviewed tags.
+
 ## Pipeline
 
 ```
