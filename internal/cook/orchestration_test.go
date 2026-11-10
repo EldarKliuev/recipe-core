@@ -292,6 +292,29 @@ func TestWorkerFallsBackImmediatelyOnUnusableModelOutput(t *testing.T) {
 	}
 }
 
+// Failed runs are the ones worth analysing, so the metadata llm-service sends
+// with a 422 must reach generation_runs instead of empty model and retries.
+func TestWorkerRecordsLLMMetadataOfAnUnusableRun(t *testing.T) {
+	meta := RunMeta{Provider: "lmstudio", Model: "qwen/qwen3.5-9b", PromptVersion: "v1", LatencyMS: 2100, Retries: 2}
+	h := newHarness(t, []llmReply{{
+		resp: LLMAdaptResponse{Meta: meta},
+		err:  fmt.Errorf("%w: schema repair exhausted", ErrModelUnusable),
+	}}, 3)
+
+	h.runJob(t, user.Prefs{})
+
+	if len(h.store.runs) != 1 {
+		t.Fatalf("runs = %+v, want the single failed call recorded", h.store.runs)
+	}
+	run := h.store.runs[0]
+	if run.Status != recipehistory.RunError {
+		t.Errorf("Status = %q, want %q", run.Status, recipehistory.RunError)
+	}
+	if run.Model != meta.Model || run.PromptVersion != meta.PromptVersion || run.Retries != 2 || run.LatencyMS != 2100 {
+		t.Errorf("run = %+v, want model, prompt version, retries and latency from llm-service", run)
+	}
+}
+
 // A 400 from llm-service means the two services disagree about the contract. It
 // must fail loudly rather than being retried and then reported to the user as
 // "the model output was rejected", which hides a bug on our side.

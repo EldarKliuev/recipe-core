@@ -144,6 +144,52 @@ func TestAdaptClassifiesUnprocessableAsModelUnusable(t *testing.T) {
 	}
 }
 
+// llm-service puts the run metadata of a failed run under error.detail.meta, so
+// generation_runs keeps the model and retries of the runs worth analysing.
+func TestAdaptReturnsRunMetadataWithUnprocessable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error": {"code": "invalid_model_output", "message": "model output still invalid",
+			"detail": {"reason": "not json", "raw_excerpt": "{", "meta": {"provider": "lmstudio",
+			"model": "qwen/qwen3.5-9b", "prompt_version": "v1", "latency_ms": 2100, "queue_wait_ms": 3,
+			"retries": 2, "prompt_tokens": 900, "completion_tokens": null}}}, "request_id": "r1"}`))
+	}))
+	defer srv.Close()
+
+	resp, err := NewLLMClient(srv.URL, 5*time.Second).Adapt(context.Background(), LLMAdaptRequest{})
+	if !errors.Is(err, ErrModelUnusable) {
+		t.Fatalf("error = %v, want it to wrap ErrModelUnusable", err)
+	}
+	if !strings.Contains(err.Error(), "invalid_model_output") {
+		t.Errorf("error = %v, want the upstream code kept", err)
+	}
+	m := resp.Meta
+	if m.Model != "qwen/qwen3.5-9b" || m.PromptVersion != "v1" || m.Retries != 2 || m.LatencyMS != 2100 {
+		t.Errorf("Meta = %+v, want the metadata from error.detail.meta", m)
+	}
+	if m.PromptTokens == nil || *m.PromptTokens != 900 || m.CompletionTokens != nil {
+		t.Errorf("tokens = %v/%v, want 900 and nil", m.PromptTokens, m.CompletionTokens)
+	}
+}
+
+// A 400 carries the pydantic error list in error.detail. It is not metadata and
+// must not break reading the code and message.
+func TestAdaptKeepsBadRequestCodeWhenDetailIsAList(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error": {"code": "invalid_request", "message": "bad payload", "detail": [{"loc": ["body"]}]}}`))
+	}))
+	defer srv.Close()
+
+	resp, err := NewLLMClient(srv.URL, 5*time.Second).Adapt(context.Background(), LLMAdaptRequest{})
+	if !errors.Is(err, ErrRequestRejected) || !strings.Contains(err.Error(), "invalid_request: bad payload") {
+		t.Fatalf("error = %v, want ErrRequestRejected with the upstream code and message", err)
+	}
+	if resp.Meta != (RunMeta{}) {
+		t.Errorf("Meta = %+v, want none outside a 422", resp.Meta)
+	}
+}
+
 // 504 is llm-service's provider_timeout. Like 503 it is an availability problem,
 // so it must not be retried as though the model had answered badly.
 func TestAdaptClassifiesProviderTimeoutAsUnavailable(t *testing.T) {
