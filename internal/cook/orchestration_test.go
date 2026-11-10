@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -518,4 +519,110 @@ func TestJobIsNotReadableByAnotherUser(t *testing.T) {
 	if _, err := h.svc.Job(ctx, uuid.New(), job.ID); !errors.Is(err, httpx.ErrNotFound) {
 		t.Errorf("Job() error = %v, want %v for a different user", err, httpx.ErrNotFound)
 	}
+}
+
+// blockingLLM stands in for a generation still running when the server stops:
+// it holds the call until ctx is cancelled.
+type blockingLLM struct {
+	started chan struct{}
+	calls   atomic.Int32
+}
+
+func (b *blockingLLM) Adapt(ctx context.Context, _ LLMAdaptRequest) (LLMAdaptResponse, error) {
+	if b.calls.Add(1) == 1 {
+		close(b.started)
+	}
+	<-ctx.Done()
+	return LLMAdaptResponse{}, ctx.Err()
+}
+
+// assertStoppedAndKeyReleased checks that a job ended by shutdown is failed with
+// the restart message and that its Idempotency-Key lets a retry start a new job.
+func (h *harness) assertStoppedAndKeyReleased(t *testing.T, job Job, key string) {
+	t.Helper()
+	ctx := context.Background()
+
+	got, err := h.jobs.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("read job %s: %v", job.ID, err)
+	}
+	if got.Status != JobFailed {
+		t.Errorf("job %s Status = %q, want %q", job.ID, got.Status, JobFailed)
+	}
+	if got.Error != msgStopped {
+		t.Errorf("job %s Error = %q, want %q", job.ID, got.Error, msgStopped)
+	}
+
+	retry, err := h.svc.Adapt(ctx, h.userID, key, AdaptRequest{RecipeID: 100})
+	if err != nil {
+		t.Fatalf("retry Adapt(%q) error = %v", key, err)
+	}
+	if retry.ID == job.ID {
+		t.Errorf("retry with key %q returned the stopped job, want a new one", key)
+	}
+}
+
+// Shutdown cancels the in-flight call and the pool exits on its own: the running
+// job and the one still queued must both end failed with free keys, not hang in
+// running/queued until JOB_TTL with an open SSE stream.
+func TestWorkerFailsRunningAndQueuedJobsWhenShutdownCancelsThePool(t *testing.T) {
+	h := newHarness(t, nil, 2)
+	llm := &blockingLLM{started: make(chan struct{})}
+	h.worker.llm = llm
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.worker.Start(ctx)
+
+	running, err := h.svc.Adapt(context.Background(), h.userID, "key-running", AdaptRequest{RecipeID: 100})
+	if err != nil {
+		t.Fatalf("Adapt(running) error = %v", err)
+	}
+	<-llm.started
+	queued, err := h.svc.Adapt(context.Background(), h.userID, "key-queued", AdaptRequest{RecipeID: 100})
+	if err != nil {
+		t.Fatalf("Adapt(queued) error = %v", err)
+	}
+
+	cancel()
+	// Wait for the pool only, not Stop: queued jobs must be failed by the
+	// workers themselves, before the HTTP server waits for open SSE streams.
+	h.worker.wg.Wait()
+
+	if got := len(h.worker.queue); got != 0 {
+		t.Errorf("queued tasks after shutdown = %d, want 0", got)
+	}
+	got, err := h.jobs.Get(context.Background(), running.ID)
+	if err != nil {
+		t.Fatalf("read running job: %v", err)
+	}
+	if got.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1: a cancelled call must not be retried", got.Attempts)
+	}
+	if len(h.store.adapted) != 0 {
+		t.Errorf("saved adapted recipes = %d, want 0: shutdown must not serve a fallback", len(h.store.adapted))
+	}
+	h.assertStoppedAndKeyReleased(t, running, "key-running")
+	h.assertStoppedAndKeyReleased(t, queued, "key-queued")
+}
+
+// A task can be enqueued while the HTTP server is still draining, after the pool
+// has exited. Stop fails it rather than leaving it queued.
+func TestWorkerStopFailsJobsLeftInTheQueue(t *testing.T) {
+	h := newHarness(t, nil, 1)
+
+	job, err := h.svc.Adapt(context.Background(), h.userID, "key-1", AdaptRequest{RecipeID: 100})
+	if err != nil {
+		t.Fatalf("Adapt() error = %v", err)
+	}
+
+	h.worker.Stop()
+
+	if got := len(h.worker.queue); got != 0 {
+		t.Errorf("queued tasks after Stop = %d, want 0", got)
+	}
+	if h.llm.calls != 0 {
+		t.Errorf("llm calls = %d, want 0: Stop must not start queued work", h.llm.calls)
+	}
+	h.assertStoppedAndKeyReleased(t, job, "key-1")
 }

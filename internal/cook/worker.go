@@ -89,7 +89,15 @@ func (w *Worker) Bind(svc *Service) {
 	w.svc = svc
 }
 
-// Start launches the pool. Workers drain on ctx cancellation.
+// msgStopped is the job error when shutdown interrupts or pre-empts a job.
+const msgStopped = "the server restarted before this recipe was adapted; please try again"
+
+// finalWriteTimeout bounds the last writes of a job made after shutdown has
+// cancelled the worker context.
+const finalWriteTimeout = 5 * time.Second
+
+// Start launches the pool. On ctx cancellation each worker fails the jobs still
+// queued and exits; the in-flight call is cancelled through the same ctx.
 func (w *Worker) Start(ctx context.Context) {
 	for i := 0; i < w.size; i++ {
 		w.wg.Add(1)
@@ -99,6 +107,9 @@ func (w *Worker) Start(ctx context.Context) {
 			for {
 				select {
 				case <-ctx.Done():
+					// Failing queued jobs here rather than only in Stop ends their
+					// SSE streams before the HTTP server waits for open connections.
+					w.dropQueued()
 					return
 				case t, ok := <-w.queue:
 					if !ok {
@@ -111,10 +122,39 @@ func (w *Worker) Start(ctx context.Context) {
 	}
 }
 
-// Stop waits for in-flight tasks. Queued-but-unstarted tasks are dropped: their
-// jobs expire in Redis and the user can press the button again.
+// Stop waits for in-flight tasks, then fails whatever is still queued, including
+// tasks enqueued while the HTTP server was shutting down. Jobs are not resumed:
+// the user presses the button again, and the released key lets the retry through.
 func (w *Worker) Stop() {
 	w.wg.Wait()
+	w.dropQueued()
+}
+
+// dropQueued fails every queued task without blocking.
+func (w *Worker) dropQueued() {
+	for {
+		select {
+		case t := <-w.queue:
+			log := w.log.With(slog.String("job_id", t.Job.ID.String()), slog.String("user_id", t.Job.UserID.String()))
+			w.fail(context.Background(), log, t, t.Job, msgStopped, errors.New("the worker stopped before the job started"))
+		default:
+			return
+		}
+	}
+}
+
+// finalContext lets the last write of a job land after shutdown cancelled ctx.
+// Without it the job would stay queued or running until JOB_TTL, its SSE stream
+// would not end, and a retry with the same Idempotency-Key would get it back.
+func finalContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), finalWriteTimeout)
+}
+
+// saveFinal stores a job in a terminal state.
+func (w *Worker) saveFinal(ctx context.Context, job Job) error {
+	ctx, cancel := finalContext(ctx)
+	defer cancel()
+	return w.jobs.Save(ctx, job)
 }
 
 // Enqueue is non-blocking. A full queue is reported as unavailable rather than
@@ -175,6 +215,12 @@ func (w *Worker) run(ctx context.Context, log *slog.Logger, t task) {
 		latency := int(time.Since(started).Milliseconds())
 
 		if err != nil {
+			// Shutdown cancelled the call. Retrying on a cancelled context cannot
+			// succeed, and the model was not at fault.
+			if ctx.Err() != nil {
+				w.fail(ctx, log, t, job, msgStopped, err)
+				return
+			}
 			w.recordRun(ctx, job, resp.Meta, latency, recipehistory.RunError, err.Error())
 			switch {
 			// A transport or availability failure is not the model being wrong;
@@ -224,7 +270,7 @@ func (w *Worker) run(ctx context.Context, log *slog.Logger, t task) {
 
 		job.Status = JobDone
 		job.Result = &result
-		if err := w.jobs.Save(ctx, job); err != nil {
+		if err := w.saveFinal(ctx, job); err != nil {
 			log.Error("could not store job result", slog.Any("error", err))
 		}
 		log.Info("adaptation done",
@@ -254,7 +300,7 @@ func (w *Worker) serveFallback(ctx context.Context, log *slog.Logger, t task, jo
 
 	job.Status = JobDone
 	job.Result = &result
-	if err := w.jobs.Save(ctx, job); err != nil {
+	if err := w.saveFinal(ctx, job); err != nil {
 		log.Error("could not store fallback result", slog.Any("error", err))
 	}
 	log.Warn("served unadapted fallback",
@@ -311,6 +357,14 @@ func (w *Worker) recordRun(ctx context.Context, job Job, meta RunMeta, latency i
 }
 
 func (w *Worker) fail(ctx context.Context, log *slog.Logger, t task, job Job, message string, cause error) {
+	// Any step can fail because shutdown cancelled ctx; the user is told the
+	// actual reason rather than the symptom of the step that happened to break.
+	if ctx.Err() != nil {
+		message = msgStopped
+	}
+	ctx, cancel := finalContext(ctx)
+	defer cancel()
+
 	// Release the idempotency key so the user can retry the same action without
 	// getting the failed job handed back to them.
 	w.jobs.ReleaseIdempotencyKey(ctx, job.UserID, t.IdempotencyKey)
