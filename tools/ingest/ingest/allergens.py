@@ -15,7 +15,7 @@ import collections
 import csv
 import re
 from pathlib import Path
-from typing import Container, Iterable
+from typing import Container, Iterable, Mapping
 
 # Same order as user.KnownAllergens, which is also the order tags are proposed in.
 ALLERGENS: tuple[str, ...] = (
@@ -347,6 +347,25 @@ def recipes_losing_allergens(records: Iterable[dict], resolvable: Container[str]
             recipes += 1
             by_tag.update(lost)
     return recipes, by_tag, names
+
+
+def synonyms_losing_allergens(synonyms: Mapping[str, str],
+                              target_tags: Mapping[str, Iterable[str]] | None = None
+                              ) -> dict[str, str]:
+    """Return the synonyms whose name the rules tag with more than their target has.
+
+    A recipe line carrying a synonym is stored under the target's id, so the
+    deny-list sees only the target's tags: "sardine in oil" mapped onto "oil"
+    reaches a user allergic to fish. Target tags come from `target_tags` when
+    given (the reviewed file at `load`), otherwise from the rules.
+    """
+    lost: dict[str, str] = {}
+    for name, target in synonyms.items():
+        have = set(target_tags[target]) if target_tags is not None and target in target_tags \
+            else set(tag(target))
+        if not set(tag(name)) <= have:
+            lost[name] = target
+    return lost
 
 
 REVIEW_COLUMNS = ["canonical_name", "allergens", "occurrences", "confirmed"]

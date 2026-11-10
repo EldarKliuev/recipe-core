@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import allergens as allergen_rules
-from . import db
 from .parser import parse_line
 
 DATA = Path(os.environ.get("INGEST_DATA_DIR", "/data"))
@@ -263,6 +262,8 @@ def cmd_catalog(args: argparse.Namespace) -> int:
     share = unresolved_occurrences / max(occurrences, 1)
     lost_recipes, lost_tags, lost_names = allergen_rules.recipes_losing_allergens(
         _read_parsed(), canonical | synonyms.keys())
+    # Counted apart from lost_recipes, which takes every synonym as resolved.
+    lost_synonyms = allergen_rules.synonyms_losing_allergens(synonyms)
 
     WORK.mkdir(parents=True, exist_ok=True)
     CATALOG.write_text(json.dumps({
@@ -283,6 +284,7 @@ def cmd_catalog(args: argparse.Namespace) -> int:
     print(f"synonym mappings:    {len(synonyms)}")
     print(f"unresolved names:    {len(unresolved)}  ({share:.2%} of all line occurrences)")
     print(f"recipes losing an allergen line: {lost_recipes}")
+    print(f"synonyms losing an allergen:     {len(lost_synonyms)}")
     print(f"wrote {CATALOG} and {UNRESOLVED}")
 
     # Checked apart from the share: a few lost lines pass the 5% criterion, yet
@@ -290,6 +292,10 @@ def cmd_catalog(args: argparse.Namespace) -> int:
     if lost_recipes:
         print(f"\nFAIL: {lost_recipes} recipes would lose an allergen line at load "
               f"({_counts(lost_tags)}), e.g. {_counts(lost_names, 10)}.")
+        return 1
+    if lost_synonyms:
+        print(f"\nFAIL: {len(lost_synonyms)} synonyms map onto an entry without their "
+              f"allergens, e.g. {_pairs(lost_synonyms)}.")
         return 1
     if share > MAX_UNRESOLVED_SHARE:
         print(f"\nFAIL: unresolved share {share:.2%} exceeds the {MAX_UNRESOLVED_SHARE:.0%} "
@@ -390,6 +396,15 @@ def cmd_load(args: argparse.Namespace) -> int:
         raise SystemExit(f"{lost_recipes} recipes would lose an allergen line "
                          f"({_counts(lost_tags)}), e.g. {_counts(lost_names, 10)}; "
                          f"re-run `catalog`")
+    # Against the reviewed tags, which are what the database will hold.
+    lost_synonyms = allergen_rules.synonyms_losing_allergens(
+        {s: target for s, target in synonyms.items() if target in names}, reviewed)
+    if lost_synonyms:
+        raise SystemExit(f"{len(lost_synonyms)} synonyms map onto an entry without their "
+                         f"allergens, e.g. {_pairs(lost_synonyms)}; re-run `catalog`")
+
+    # Imported here so the other stages, and the tests, run without psycopg.
+    from . import db
 
     conn = db.connect()
     try:
@@ -446,17 +461,30 @@ def _match_head_noun(name: str, canonical: set[str]) -> str | None:
     "apple", because the head noun there is vinegar. Matching on the tail rather
     than any substring is what keeps that distinction. The longest tail wins, so
     "granny smith apple" prefers "smith apple" over "apple" if both are canonical.
+
+    A tail without every allergen the name carries is skipped: the line would be
+    stored under the tail's id, and "sardine in oil" would reach the deny-list as
+    "oil". With no safe tail the name stays unresolved, and `catalog` promotes it.
     """
     words = name.split()
+    name_tags: set[str] | None = None
     for start in range(1, len(words)):
         tail = " ".join(words[start:])
-        if tail in canonical:
+        if tail not in canonical:
+            continue
+        if name_tags is None:
+            name_tags = set(allergen_rules.tag(name))
+        if name_tags <= set(allergen_rules.tag(tail)):
             return tail
     return None
 
 
 def _counts(counter: collections.Counter[str], limit: int | None = None) -> str:
     return ", ".join(f"{key} {count}" for key, count in counter.most_common(limit))
+
+
+def _pairs(synonyms: dict[str, str], limit: int = 10) -> str:
+    return ", ".join(f"{name} -> {target}" for name, target in list(synonyms.items())[:limit])
 
 
 def _read_parsed() -> Iterator[dict[str, Any]]:
