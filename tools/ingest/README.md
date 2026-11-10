@@ -40,11 +40,34 @@ docker compose --profile ingest run --rm ingest catalog
 docker compose --profile ingest run --rm ingest allergens
 docker compose --profile ingest run --rm ingest load
 
-# or the whole thing
+# or the whole thing; on a fresh run it stops at `load` until the review is done
 docker compose --profile ingest run --rm ingest all
 ```
 
 Put the Kaggle CSV at `data/recipes.csv` (mounted as `/data/recipes.csv`).
+
+## Allergen review
+
+`allergens` writes `data/work/allergens_review.csv` with one row per catalog
+entry: the proposed tags and an empty `confirmed` column. Go through every row,
+fix `allergens` where the proposal is wrong (space-separated tags from
+`user.KnownAllergens`, empty for none) and set `confirmed` to `yes`. Untagged
+rows need the same look as tagged ones: a missed tag is the dangerous mistake.
+
+`load` refuses to start while any catalog entry lacks `confirmed=yes`, a tag is
+outside the vocabulary or the file is missing. A catalog rebuilt after the review
+adds names the reviewer never saw, so `load` refuses that file too.
+
+`allergens` never overwrites an existing file, so your edits survive a re-run.
+After changing the rules, delete the file to get new proposals, and review it again.
+
+Rules match whole words, every matching rule adds its tags, and a longer rule
+hides the words it matched from shorter ones (`coconut milk` is not dairy).
+They live in `ingest/allergens.py`; tests are in `tests/`:
+
+```bash
+make test-ingest
+```
 
 ## Long tail
 
