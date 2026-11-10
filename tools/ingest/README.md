@@ -17,6 +17,12 @@ The acceptance criterion from the service plan is therefore about parsing, not
 about row counts: **fewer than 5% unresolved ingredient lines**, plus a manual
 review of a 200-row sample.
 
+That share does not cover allergens. `load` drops a line without a catalog id,
+and the deny-list cannot filter what was dropped. So a name the allergen rules
+tag becomes a catalog entry however rare it is (`crab`, `feta`), and `catalog`
+fails if any recipe would still lose a tagged line. `load` repeats the check
+before writing anything.
+
 ## Pipeline
 
 ```

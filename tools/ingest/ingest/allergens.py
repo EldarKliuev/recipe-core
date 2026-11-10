@@ -11,10 +11,11 @@ Tag vocabulary must stay in sync with `user.KnownAllergens` in the Go code.
 
 from __future__ import annotations
 
+import collections
 import csv
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Container, Iterable
 
 # Same order as user.KnownAllergens, which is also the order tags are proposed in.
 ALLERGENS: tuple[str, ...] = (
@@ -317,6 +318,35 @@ def tag(canonical_name: str) -> tuple[str, ...]:
             return " " * len(match.group(0))
         text = pattern.sub(consume, text)
     return tuple(t for t in ALLERGENS if t in found)
+
+
+def recipes_losing_allergens(records: Iterable[dict], resolvable: Container[str]
+                             ) -> tuple[int, collections.Counter[str], collections.Counter[str]]:
+    """Count recipes where a line the rules tag would get no catalog id.
+
+    `load` drops such a line, so the recipe is stored without the allergen and the
+    SQL deny-list cannot see it. Returns the number of such recipes, the same
+    count per tag, and the dropped names with their occurrences.
+    """
+    tags_of: dict[str, tuple[str, ...]] = {}
+    recipes = 0
+    by_tag: collections.Counter[str] = collections.Counter()
+    names: collections.Counter[str] = collections.Counter()
+    for record in records:
+        lost: set[str] = set()
+        for line in record["lines"]:
+            name = line["name"]
+            if name in resolvable:
+                continue
+            if name not in tags_of:
+                tags_of[name] = tag(name)
+            if tags_of[name]:
+                lost.update(tags_of[name])
+                names[name] += 1
+        if lost:
+            recipes += 1
+            by_tag.update(lost)
+    return recipes, by_tag, names
 
 
 REVIEW_COLUMNS = ["canonical_name", "allergens", "occurrences", "confirmed"]

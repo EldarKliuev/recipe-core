@@ -241,6 +241,15 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         else:
             unresolved[name] = count
 
+    # A name the allergen rules tag becomes an entry however rare it is: `load`
+    # drops a line without a catalog id, and the deny-list cannot see a dropped
+    # line. Done before the LLM step, so a guess cannot map it onto an entry
+    # without that allergen. Each promoted name still goes through the review file.
+    promoted = {name for name in unresolved if allergen_rules.tag(name)}
+    canonical |= promoted
+    for name in promoted:
+        del unresolved[name]
+
     if args.use_llm and unresolved:
         from .llm import normalise_batch
         proposals = normalise_batch(list(unresolved))
@@ -252,6 +261,8 @@ def cmd_catalog(args: argparse.Namespace) -> int:
     occurrences = sum(freq.values())
     unresolved_occurrences = sum(unresolved.values())
     share = unresolved_occurrences / max(occurrences, 1)
+    lost_recipes, lost_tags, lost_names = allergen_rules.recipes_losing_allergens(
+        _read_parsed(), canonical | synonyms.keys())
 
     WORK.mkdir(parents=True, exist_ok=True)
     CATALOG.write_text(json.dumps({
@@ -267,11 +278,19 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         writer.writerows(unresolved.most_common())
 
     print(f"distinct names:      {len(freq)}")
-    print(f"canonical entries:   {len(canonical)}  (min_freq={args.min_freq})")
+    print(f"canonical entries:   {len(canonical)}  (min_freq={args.min_freq}, "
+          f"{len(promoted)} below it for carrying an allergen)")
     print(f"synonym mappings:    {len(synonyms)}")
     print(f"unresolved names:    {len(unresolved)}  ({share:.2%} of all line occurrences)")
+    print(f"recipes losing an allergen line: {lost_recipes}")
     print(f"wrote {CATALOG} and {UNRESOLVED}")
 
+    # Checked apart from the share: a few lost lines pass the 5% criterion, yet
+    # each one is a recipe the allergen filter lets through.
+    if lost_recipes:
+        print(f"\nFAIL: {lost_recipes} recipes would lose an allergen line at load "
+              f"({_counts(lost_tags)}), e.g. {_counts(lost_names, 10)}.")
+        return 1
     if share > MAX_UNRESOLVED_SHARE:
         print(f"\nFAIL: unresolved share {share:.2%} exceeds the {MAX_UNRESOLVED_SHARE:.0%} "
               f"acceptance threshold. Inspect {UNRESOLVED} and add parser rules.")
@@ -361,6 +380,17 @@ def cmd_load(args: argparse.Namespace) -> int:
     except allergen_rules.ReviewError as err:
         raise SystemExit(str(err)) from None
 
+    # Repeated here because catalog.json may come from an older `catalog` run,
+    # or be edited by hand, after the check there passed.
+    names = set(canonical)
+    resolvable = names | {s for s, target in synonyms.items() if target in names}
+    lost_recipes, lost_tags, lost_names = allergen_rules.recipes_losing_allergens(
+        _read_parsed(), resolvable)
+    if lost_recipes:
+        raise SystemExit(f"{lost_recipes} recipes would lose an allergen line "
+                         f"({_counts(lost_tags)}), e.g. {_counts(lost_names, 10)}; "
+                         f"re-run `catalog`")
+
     conn = db.connect()
     try:
         print(f"upserting {len(canonical)} canonical ingredients")
@@ -423,6 +453,10 @@ def _match_head_noun(name: str, canonical: set[str]) -> str | None:
         if tail in canonical:
             return tail
     return None
+
+
+def _counts(counter: collections.Counter[str], limit: int | None = None) -> str:
+    return ", ".join(f"{key} {count}" for key, count in counter.most_common(limit))
 
 
 def _read_parsed() -> Iterator[dict[str, Any]]:

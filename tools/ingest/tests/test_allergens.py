@@ -153,5 +153,31 @@ class ReadReviewTest(unittest.TestCase):
             allergens.read_review(self.path, ["milk"])
 
 
+class RecipesLosingAllergensTest(unittest.TestCase):
+    @staticmethod
+    def recipe(*names: str) -> dict:
+        return {"lines": [{"name": name} for name in names]}
+
+    def test_counts_recipes_whose_tagged_line_has_no_catalog_id(self) -> None:
+        records = [
+            self.recipe("crab", "feta", "salt"),  # two allergens lost, one recipe
+            self.recipe("crab", "rice"),
+            self.recipe("salt", "rice"),
+        ]
+        recipes, by_tag, names = allergens.recipes_losing_allergens(records, {"salt", "rice"})
+        self.assertEqual(recipes, 2)
+        self.assertEqual(by_tag, {"shellfish": 2, "dairy": 1})
+        self.assertEqual(names, {"crab": 2, "feta": 1})
+
+    def test_resolvable_tagged_lines_are_not_lost(self) -> None:
+        records = [self.recipe("crab", "feta")]
+        self.assertEqual(allergens.recipes_losing_allergens(records, {"crab", "feta"})[0], 0)
+
+    def test_untagged_unresolved_lines_are_not_counted(self) -> None:
+        # Dropping these skews missing_count, but lets no allergen through.
+        records = [self.recipe("eggplant", "mystery garnish")]
+        self.assertEqual(allergens.recipes_losing_allergens(records, set())[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
