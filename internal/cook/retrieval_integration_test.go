@@ -197,6 +197,46 @@ func TestIsRetrievableForGuardsAdaptation(t *testing.T) {
 	}
 }
 
+// Adaptation checks a chosen recipe at max_missing=10, so anything search could
+// have shown must pass, while allergens and dislikes still refuse it.
+func TestIsRetrievableForAtTheWidestMaxMissing(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	repo := NewRetrievalRepo(pool)
+	ctx := context.Background()
+	q := Query{UserID: seed.userID, MaxMissing: maxMaxMissing, UseSoonBefore: time.Now()}
+
+	cases := []struct {
+		name     string
+		recipe   int64
+		mutate   func(*Query)
+		expected bool
+	}{
+		{"five missing", seed.fiveShort, nil, true},
+		{"eleven missing", seed.elevenShort, nil, false},
+		{"five missing with a disliked ingredient", seed.fiveShort,
+			func(q *Query) { q.DislikedIDs = []int64{seed.basilID} }, false},
+		{"dairy recipe for a dairy-allergic user", seed.creamyPasta,
+			func(q *Query) { q.Allergens = []string{"dairy"} }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cq := q
+			if tc.mutate != nil {
+				tc.mutate(&cq)
+			}
+			ok, err := repo.IsRetrievableFor(ctx, cq, tc.recipe)
+			if err != nil {
+				t.Fatalf("IsRetrievableFor() error = %v", err)
+			}
+			if ok != tc.expected {
+				t.Errorf("IsRetrievableFor() = %v, want %v", ok, tc.expected)
+			}
+		})
+	}
+}
+
 func TestHaveIngredientIDsIncludesStaples(t *testing.T) {
 	pool, cleanup := testPool(t)
 	defer cleanup()
@@ -226,7 +266,10 @@ type corpusSeed struct {
 	chickenRice int64
 	creamyPasta int64
 	longRecipe  int64
+	fiveShort   int64
+	elevenShort int64
 	chickenID   int64
+	basilID     int64
 	saltID      int64
 }
 
@@ -333,7 +376,8 @@ func seedCorpus(t *testing.T, pool *pgxpool.Pool) corpusSeed {
 
 	ingredients := map[string]*int64{}
 	for _, name := range []string{"chicken breast", "rice", "salt", "heavy cream", "pasta",
-		"tomato", "onion", "garlic", "basil", "parmesan", "saffron", "truffle"} {
+		"tomato", "onion", "garlic", "basil", "parmesan", "saffron", "truffle",
+		"lemon", "thyme", "paprika", "cumin", "ginger", "fennel"} {
 		var id int64
 		err := pool.QueryRow(ctx,
 			`INSERT INTO ingredients_catalog (canonical_name, category) VALUES ($1, 'test')
@@ -348,6 +392,7 @@ func seedCorpus(t *testing.T, pool *pgxpool.Pool) corpusSeed {
 	id := func(name string) int64 { return *ingredients[name] }
 
 	seed.chickenID = id("chicken breast")
+	seed.basilID = id("basil")
 	seed.saltID = id("salt")
 
 	// Salt is a staple, so it must not count as missing anywhere.
@@ -418,6 +463,12 @@ INSERT INTO recipe_ingredients (recipe_id, ingredient_id, raw_text) VALUES ($1, 
 	insertRecipe("Tomato pasta", 5, "pasta", "tomato", "basil", "saffron")
 	// Long recipe for the complexity filter.
 	seed.longRecipe = insertRecipe("Elaborate risotto", 9, "rice", "onion", "garlic", "truffle")
+	// Five and eleven ingredients short: adaptation accepts a chosen recipe up to
+	// the widest max_missing search allows (10), and no further.
+	seed.fiveShort = insertRecipe("Herb pasta", 6, "pasta", "basil", "saffron", "truffle",
+		"lemon", "thyme")
+	seed.elevenShort = insertRecipe("Spice feast", 7, "rice", "basil", "saffron", "truffle",
+		"lemon", "thyme", "paprika", "cumin", "ginger", "fennel", "heavy cream", "parmesan")
 
 	return seed
 }

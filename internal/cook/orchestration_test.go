@@ -46,13 +46,16 @@ type fakeRetrieval struct {
 	haveIDs     []int64
 	retrievable bool
 	err         error
+	// lastRetrievableQuery is the query IsRetrievableFor was last called with.
+	lastRetrievableQuery Query
 }
 
 func (f *fakeRetrieval) Coverage(context.Context, Query) ([]coverageRow, error) {
 	return f.rows, f.err
 }
 
-func (f *fakeRetrieval) IsRetrievableFor(context.Context, Query, int64) (bool, error) {
+func (f *fakeRetrieval) IsRetrievableFor(_ context.Context, q Query, _ int64) (bool, error) {
+	f.lastRetrievableQuery = q
 	return f.retrievable, f.err
 }
 
@@ -508,6 +511,20 @@ func TestAdaptRejectsARecipeOutsideTheUsersMatches(t *testing.T) {
 	_, err := h.svc.Adapt(context.Background(), h.userID, "key-1", AdaptRequest{RecipeID: 100})
 	if !errors.Is(err, httpx.ErrInvalidInput) {
 		t.Errorf("Adapt() error = %v, want %v", err, httpx.ErrInvalidInput)
+	}
+}
+
+// The web sends only recipe_id, not the max_missing of the search that showed
+// it, so a chosen recipe is checked at the widest limit search accepts rather
+// than the default of 3.
+func TestAdaptChecksAChosenRecipeAtTheWidestMaxMissing(t *testing.T) {
+	h := newHarness(t, nil, 1)
+
+	if _, err := h.svc.Adapt(context.Background(), h.userID, "key-1", AdaptRequest{RecipeID: 100}); err != nil {
+		t.Fatalf("Adapt() error = %v", err)
+	}
+	if got := h.svc.retrieval.(*fakeRetrieval).lastRetrievableQuery.MaxMissing; got != maxMaxMissing {
+		t.Errorf("IsRetrievableFor got max_missing %d, want %d", got, maxMaxMissing)
 	}
 }
 

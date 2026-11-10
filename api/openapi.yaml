@@ -356,8 +356,8 @@ paths:
         than queueing a second generation.
 
         Omit `recipe_id` to let the model choose among your top five matches.
-        Supplying a recipe you were not offered (too many missing ingredients, or
-        an allergen conflict) is a 400.
+        Supplying a recipe search could not show you (more than 10 missing
+        ingredients, a denied allergen or a disliked ingredient) is a 400.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -631,8 +631,10 @@ components:
           type: integer
           format: int64
           description: |
-            Must be one of your matches. Omit to let the model choose among the
-            top five.
+            Must be a recipe search could show you at any allowed max_missing:
+            at most 10 ingredients missing, no denied allergens and no disliked
+            ingredients; otherwise 400. Omit to let the model choose among the
+            top five at the default max_missing.
         servings: { type: integer, minimum: 1, maximum: 12 }
         notes:
           type: string
