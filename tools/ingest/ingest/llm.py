@@ -12,8 +12,13 @@ import os
 import httpx
 
 
-def normalise_batch(lines: list[str], batch_size: int = 40, timeout: float = 300.0) -> dict[str, str]:
-    """Map raw line -> canonical ingredient name for as many lines as possible."""
+def normalise_batch(lines: list[str], batch_size: int = 20, timeout: float = 300.0) -> dict[str, str]:
+    """Map raw line -> canonical ingredient name for as many lines as possible.
+
+    llm-service answers each line with a full JSON record, about 35-42 tokens, under a
+    shared LLM_MAX_TOKENS=1536. A batch of 40 needs 1350-1700 and gets cut off; a
+    truncated answer is not repaired, so the whole batch is lost. 20 needs 680-850.
+    """
     base_url = os.environ.get("LLM_SERVICE_URL", "http://llm-service:9000").rstrip("/")
     out: dict[str, str] = {}
 
