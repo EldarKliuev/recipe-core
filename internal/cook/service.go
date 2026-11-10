@@ -277,18 +277,24 @@ func (s *Service) Adapt(ctx context.Context, userID uuid.UUID, idemKey string, r
 }
 
 // candidates resolves which recipes the model may choose from. A recipe the user
-// was never offered is rejected here rather than in the validator, so the user
-// gets a 400 instead of a failed job.
+// could not have been offered is rejected here rather than in the validator, so
+// the user gets a 400 instead of a failed job.
+//
+// A chosen recipe is checked against the widest max_missing search accepts:
+// AdaptRequest does not carry the max_missing of the search that showed it, so
+// the default would refuse recipes shown with a higher limit. Allergens and
+// dislikes are still enforced in full.
 func (s *Service) candidates(ctx context.Context, q Query, requested int64) ([]int64, error) {
 	if requested > 0 {
+		q.MaxMissing = maxMaxMissing
 		ok, err := s.retrieval.IsRetrievableFor(ctx, q, requested)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
 			return nil, httpx.Invalidf(
-				"recipe %d is not among your matches; it either needs too many missing ingredients or conflicts with your allergens",
-				requested)
+				"recipe %d is not among your matches; it either needs more than %d missing ingredients or conflicts with your allergens or disliked ingredients",
+				requested, maxMaxMissing)
 		}
 		return []int64{requested}, nil
 	}

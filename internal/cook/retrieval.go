@@ -134,13 +134,18 @@ func (r *RetrievalRepo) Coverage(ctx context.Context, q Query) ([]coverageRow, e
 	return out, rows.Err()
 }
 
-// IsRetrievableFor reports whether a recipe would be returned by retrieval for
-// this user, ignoring paging limits. Adaptation uses it to reject requests for
-// recipes the user was never offered.
+// IsRetrievableFor reports whether a recipe passes the same missing-count,
+// allergen and dislike checks as retrieval. Paging and the category and
+// complexity filters are ignored. Adaptation uses it to reject requests for
+// recipes the user could not have been offered.
 func (r *RetrievalRepo) IsRetrievableFor(ctx context.Context, q Query, recipeID int64) (bool, error) {
 	allergens := q.Allergens
 	if allergens == nil {
 		allergens = []string{}
+	}
+	disliked := q.DislikedIDs
+	if disliked == nil {
+		disliked = []int64{}
 	}
 	var ok bool
 	err := r.pool.QueryRow(ctx, `
@@ -160,7 +165,10 @@ SELECT EXISTS (
     SELECT 1 FROM recipe_ingredients x
     JOIN ingredient_allergens a ON a.ingredient_id = x.ingredient_id
     WHERE x.recipe_id = $3 AND a.allergen = ANY($2::text[])
-)`, q.UserID, allergens, recipeID, q.MaxMissing).Scan(&ok)
+) AND NOT EXISTS (
+    SELECT 1 FROM recipe_ingredients d
+    WHERE d.recipe_id = $3 AND d.ingredient_id = ANY($5::bigint[])
+)`, q.UserID, allergens, recipeID, q.MaxMissing, disliked).Scan(&ok)
 	if err != nil {
 		return false, fmt.Errorf("check recipe retrievability: %w", err)
 	}
