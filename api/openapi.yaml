@@ -66,14 +66,15 @@ paths:
                 properties:
                   status: { type: string, examples: [ready] }
         "503":
-          description: A required dependency is unreachable
+          description: |
+            A required dependency is unreachable. Which one and why is written
+            to the server log only: the probe is unauthenticated.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  status: { type: string }
-                  error: { type: string }
+                  status: { type: string, examples: [unavailable] }
 
   /api/v1/auth/register:
     post:

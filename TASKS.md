@@ -28,7 +28,7 @@
 | Задачи: 202, Redis, SSE, идемпотентность, `generation_runs` | Есть; TASK-06 и TASK-07 закрыты, остаётся гонка двойной отправки (TASK-08) | `orchestration_test.go`, `handler_test.go`, `adapt_integration_test.go` |
 | Валидация ответа модели | Есть; дыры в запрете аллергенов закрыты (TASK-04, TASK-05) | `validator_test.go` |
 | История и рейтинги | Есть, тестов нет (TASK-10) | Только чтение кода |
-| `/readyz` без `llm-service`, OpenAPI | Есть; формат `expires_at` исправлен (TASK-14), остаётся текст ошибки в `/readyz` (TASK-15) | `router.go`, `api/openapi.yaml` |
+| `/readyz` без `llm-service`, OpenAPI | Есть; формат `expires_at` исправлен (TASK-14), текст ошибки из `/readyz` убран (TASK-15) | `router.go`, `api/openapi.yaml` |
 | Тесты: юнит, контрактный на `httptest` | Есть | `make test`, `llmclient_test.go`, `adapt_contract_test.go` |
 | Тесты: интеграция репозиториев, сид на 500 рецептов | Частично (TASK-10, TASK-11) | Интеграционные тесты есть только в `internal/cook`, в сиде 4 рецепта |
 
@@ -186,6 +186,8 @@
 `api/openapi.yaml:546` объявляет `format: date`, принимается `YYYY-MM-DD`, а ответ кодирует `time.Time` как `2026-11-08T00:00:00Z` (по коду, не запускалось). Сделать ответ датой без времени и добавить тест. Спецификация при этом не меняется, поэтому типы веба перегенерировать не нужно, но `formatDate` в `recipe-web` надо проверить.
 
 ### TASK-15. Не отдавать текст ошибки из `/readyz`
+
+**Статус:** закрыто 2026-11-16. Ответ `503` содержит только `{"status":"unavailable"}`, причина остаётся в логе `readiness check failed`; поле `error` убрано из `api/openapi.yaml`. Проверяют `TestReadyzDoesNotExposeTheDependencyError` и `TestReadyzReportsReady`. В `recipe-web` нужно перегенерировать `src/api/generated.ts` (`npm run check:api`).
 
 `internal/api/router.go:68` отдаёт `err.Error()` без авторизации, а в тексте ошибки подключения бывают адреса. Спецификация поле `error` допускает, поэтому при изменении нужно поправить и её. Подробности оставить в логе.
 

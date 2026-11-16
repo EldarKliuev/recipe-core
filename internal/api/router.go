@@ -62,11 +62,10 @@ func NewRouter(d Deps) http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
 		if err := d.Ready(ctx); err != nil {
+			// The probe needs no auth and connection errors carry hosts and
+			// ports, so the cause stays in the log.
 			d.Log.WarnContext(ctx, "readiness check failed", slog.Any("error", err))
-			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{
-				"status": "unavailable",
-				"error":  err.Error(),
-			})
+			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
 			return
 		}
 		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
