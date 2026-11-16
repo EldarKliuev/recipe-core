@@ -86,9 +86,17 @@ test-db: ## Create the throwaway integration-test database (idempotent)
 		| grep -q 1 \
 		|| docker compose exec -T postgres createdb -U recipes $(TEST_DB_NAME)
 
+# Integration tests skip themselves when they cannot reach Postgres, and a green
+# run with skips proves nothing, so any skip fails the target (here and in CI).
 .PHONY: test-integration
-test-integration: test-db ## Run integration tests against a throwaway database
-	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -tags=integration -count=1 ./...
+test-integration: test-db ## Run integration tests against a throwaway database; fails on skips
+	@set -o pipefail; out=$$(mktemp); trap 'rm -f "$$out"' EXIT; \
+		TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -tags=integration -count=1 -v ./... | tee "$$out"; \
+		status=$$?; \
+		if grep -q -- '--- SKIP' "$$out"; then \
+			echo; echo "integration tests were skipped:"; grep -- '--- SKIP' "$$out"; exit 1; \
+		fi; \
+		exit $$status
 
 .PHONY: lint
 lint: ## Vet and gofmt check
