@@ -226,6 +226,15 @@ func (s *Service) Adapt(ctx context.Context, userID uuid.UUID, idemKey string, r
 		return Job{}, httpx.Invalidf("notes must be at most 500 characters")
 	}
 
+	// A replayed request returns the original job rather than starting a second
+	// generation on a single-GPU model. It is looked up before candidates, so a
+	// replay after the fridge changed still gets that job instead of a 400.
+	if jobID, used, err := s.jobs.JobForIdempotencyKey(ctx, userID, idemKey); err != nil {
+		return Job{}, err
+	} else if used {
+		return s.Job(ctx, userID, jobID)
+	}
+
 	q, prefs, err := s.buildQuery(ctx, userID, MatchesRequest{})
 	if err != nil {
 		return Job{}, err
@@ -236,26 +245,21 @@ func (s *Service) Adapt(ctx context.Context, userID uuid.UUID, idemKey string, r
 		return Job{}, err
 	}
 
-	jobID, fresh, err := s.jobs.ClaimIdempotencyKey(ctx, userID, idemKey, uuid.New())
-	if err != nil {
-		return Job{}, err
-	}
-	if !fresh {
-		// A replayed request returns the original job rather than starting a
-		// second generation on a single-GPU model.
-		return s.Job(ctx, userID, jobID)
-	}
-
+	// Concurrent requests with one key can all pass the lookup above. CreateJob
+	// lets exactly one of them store a job; the rest get that stored job back.
 	job := Job{
-		ID:        jobID,
+		ID:        uuid.New(),
 		UserID:    userID,
 		RecipeID:  req.RecipeID,
 		Status:    JobQueued,
 		CreatedAt: time.Now().UTC(),
 	}
-	if err := s.jobs.Save(ctx, job); err != nil {
-		s.jobs.ReleaseIdempotencyKey(ctx, userID, idemKey)
+	jobID, created, err := s.jobs.CreateJob(ctx, idemKey, job)
+	if err != nil {
 		return Job{}, err
+	}
+	if !created {
+		return s.Job(ctx, userID, jobID)
 	}
 
 	task := task{
