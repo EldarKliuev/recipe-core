@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+// placeholderJWTSecret is the JWT_SECRET shipped in .env.example. It is long
+// enough to pass the length check, so it is rejected by value: `make bootstrap`
+// copies it into .env, and a service started with it signs tokens with a key
+// anyone can read in the repository.
+const placeholderJWTSecret = "replace-me-with-a-32-byte-or-longer-random-secret"
+
 type Config struct {
 	HTTPPort           string
 	LogLevel           string
@@ -80,6 +86,9 @@ func Load() (Config, error) {
 	}
 	if len(cfg.JWTSecret) < 32 {
 		return cfg, fmt.Errorf("JWT_SECRET is required and must be at least 32 bytes")
+	}
+	if cfg.JWTSecret == placeholderJWTSecret {
+		return cfg, fmt.Errorf("JWT_SECRET is the placeholder from .env.example; generate one with: openssl rand -hex 32")
 	}
 	return cfg, nil
 }
