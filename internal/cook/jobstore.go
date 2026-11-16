@@ -38,12 +38,20 @@ type jobRecord struct {
 	OwnerID uuid.UUID `json:"owner_id"`
 }
 
-// Save writes the job and publishes it to subscribers of its event channel.
-func (s *JobStore) Save(ctx context.Context, job Job) error {
+func marshalJob(job Job) ([]byte, error) {
 	job.UpdatedAt = time.Now().UTC()
 	payload, err := json.Marshal(jobRecord{Job: job, OwnerID: job.UserID})
 	if err != nil {
-		return fmt.Errorf("marshal job: %w", err)
+		return nil, fmt.Errorf("marshal job: %w", err)
+	}
+	return payload, nil
+}
+
+// Save writes the job and publishes it to subscribers of its event channel.
+func (s *JobStore) Save(ctx context.Context, job Job) error {
+	payload, err := marshalJob(job)
+	if err != nil {
+		return err
 	}
 	if err := s.client.Set(ctx, jobKey(job.ID), payload, s.ttl).Err(); err != nil {
 		return fmt.Errorf("store job: %w", err)
@@ -94,27 +102,56 @@ func (s *JobStore) Subscribe(ctx context.Context, id uuid.UUID) (<-chan Job, fun
 	return out, func() { _ = sub.Close() }, nil
 }
 
-// ClaimIdempotencyKey reserves key for jobID. If the key was already used it
-// returns the job id from the first request, so a retried POST returns the
-// original job instead of queueing a second generation.
-func (s *JobStore) ClaimIdempotencyKey(ctx context.Context, userID uuid.UUID, key string, jobID uuid.UUID) (uuid.UUID, bool, error) {
-	redisKey := idempotencyKey(userID, key)
-	ok, err := s.client.SetNX(ctx, redisKey, jobID.String(), s.ttl).Result()
-	if err != nil {
-		return uuid.Nil, false, fmt.Errorf("claim idempotency key: %w", err)
+// JobForIdempotencyKey returns the job id a key was claimed for, or false if the
+// key is free.
+func (s *JobStore) JobForIdempotencyKey(ctx context.Context, userID uuid.UUID, key string) (uuid.UUID, bool, error) {
+	existing, err := s.client.Get(ctx, idempotencyKey(userID, key)).Result()
+	if errors.Is(err, redis.Nil) {
+		return uuid.Nil, false, nil
 	}
-	if ok {
-		return jobID, true, nil
-	}
-	existing, err := s.client.Get(ctx, redisKey).Result()
 	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("read idempotency key: %w", err)
 	}
-	parsed, err := uuid.Parse(existing)
+	return parseJobID(existing)
+}
+
+// createJobScript claims the idempotency key and stores the job in one step, so
+// a concurrent request that finds the key always finds the job behind it too.
+// It returns the job id the key points to: the new one, or the first request's.
+var createJobScript = redis.NewScript(`
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[3]) then
+  redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
+  return ARGV[1]
+end
+return redis.call('GET', KEYS[1])
+`)
+
+// CreateJob stores a new job under an Idempotency-Key. If the key was already
+// claimed it stores nothing and returns the original job id with false, so a
+// replayed POST returns that job instead of queueing a second generation.
+func (s *JobStore) CreateJob(ctx context.Context, key string, job Job) (uuid.UUID, bool, error) {
+	payload, err := marshalJob(job)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	keys := []string{idempotencyKey(job.UserID, key), jobKey(job.ID)}
+	got, err := createJobScript.Run(ctx, s.client, keys, job.ID.String(), payload, s.ttl.Milliseconds()).Text()
+	if err != nil {
+		return uuid.Nil, false, fmt.Errorf("create job: %w", err)
+	}
+	id, _, err := parseJobID(got)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return id, id == job.ID, nil
+}
+
+func parseJobID(raw string) (uuid.UUID, bool, error) {
+	id, err := uuid.Parse(raw)
 	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("stored idempotency value is not a job id: %w", err)
 	}
-	return parsed, false, nil
+	return id, true, nil
 }
 
 // ReleaseIdempotencyKey drops the reservation so the user can retry immediately

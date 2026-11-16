@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -266,8 +267,8 @@ func TestWorkerFailsWithoutRetryWhenLLMServiceIsUnavailable(t *testing.T) {
 		t.Errorf("llm calls = %d, want 1: an unavailable service must not be retried here", h.llm.calls)
 	}
 	// The key is released so the user can press the button again.
-	if _, fresh, err := h.jobs.ClaimIdempotencyKey(context.Background(), h.userID, "key-1", uuid.New()); err != nil || !fresh {
-		t.Errorf("ClaimIdempotencyKey fresh = %v (err %v), want the key released after a failure", fresh, err)
+	if _, used, err := h.jobs.JobForIdempotencyKey(context.Background(), h.userID, "key-1"); err != nil || used {
+		t.Errorf("JobForIdempotencyKey used = %v (err %v), want the key released after a failure", used, err)
 	}
 }
 
@@ -494,6 +495,95 @@ func TestAdaptReplaysTheOriginalJobForARepeatedIdempotencyKey(t *testing.T) {
 	}
 	if got := len(h.worker.queue); got != 1 {
 		t.Errorf("queued tasks = %d, want 1: the replay must not queue a second generation", got)
+	}
+}
+
+// gatedRetrieval holds every Coverage call until all expected callers arrive,
+// so concurrent Adapt calls reach the idempotency key at the same moment.
+type gatedRetrieval struct {
+	*fakeRetrieval
+	arrived *sync.WaitGroup
+}
+
+func (g gatedRetrieval) Coverage(ctx context.Context, q Query) ([]coverageRow, error) {
+	g.arrived.Done()
+	g.arrived.Wait()
+	return g.fakeRetrieval.Coverage(ctx, q)
+}
+
+// A double-clicked form sends both requests at once. Every one of them must get
+// the same job, never a 404 for a key whose job is not stored yet.
+func TestAdaptReturnsOneJobForConcurrentRequestsWithTheSameKey(t *testing.T) {
+	const n = 16
+	h := newHarness(t, nil, 1)
+	var arrived sync.WaitGroup
+	arrived.Add(n)
+	h.svc.retrieval = gatedRetrieval{fakeRetrieval: h.svc.retrieval.(*fakeRetrieval), arrived: &arrived}
+
+	ids := make([]uuid.UUID, n)
+	errs := make([]error, n)
+	var done sync.WaitGroup
+	for i := range n {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			job, err := h.svc.Adapt(context.Background(), h.userID, "double-click", AdaptRequest{})
+			ids[i], errs[i] = job.ID, err
+		}()
+	}
+	done.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Adapt() call %d error = %v, want every concurrent replay to get the job", i, err)
+		}
+		if ids[i] != ids[0] {
+			t.Errorf("Adapt() call %d job id = %s, want %s", i, ids[i], ids[0])
+		}
+	}
+	if got := len(h.worker.queue); got != 1 {
+		t.Errorf("queued tasks = %d, want 1", got)
+	}
+}
+
+// The user may change the fridge between a submit and its replay. The replay
+// must still return the original job, not re-run candidate selection and 400.
+func TestAdaptReplaysTheOriginalJobAfterTheFridgeChanged(t *testing.T) {
+	h := newHarness(t, nil, 1)
+	ctx := context.Background()
+
+	first, err := h.svc.Adapt(ctx, h.userID, "form-submit-1", AdaptRequest{RecipeID: 100})
+	if err != nil {
+		t.Fatalf("first Adapt() error = %v", err)
+	}
+	h.svc.retrieval.(*fakeRetrieval).retrievable = false
+
+	second, err := h.svc.Adapt(ctx, h.userID, "form-submit-1", AdaptRequest{RecipeID: 100})
+	if err != nil {
+		t.Fatalf("replayed Adapt() error = %v, want the original job", err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("replayed job id = %s, want %s", second.ID, first.ID)
+	}
+}
+
+// A request rejected before queueing must not reserve the key: once the user
+// fixes the fridge, the same key starts a job.
+func TestAdaptDoesNotReserveTheKeyWhenItRejectsTheRequest(t *testing.T) {
+	h := newHarness(t, nil, 1)
+	ctx := context.Background()
+	h.svc.retrieval.(*fakeRetrieval).retrievable = false
+
+	if _, err := h.svc.Adapt(ctx, h.userID, "key-1", AdaptRequest{RecipeID: 100}); !errors.Is(err, httpx.ErrInvalidInput) {
+		t.Fatalf("Adapt() error = %v, want %v", err, httpx.ErrInvalidInput)
+	}
+	h.svc.retrieval.(*fakeRetrieval).retrievable = true
+
+	if _, err := h.svc.Adapt(ctx, h.userID, "key-1", AdaptRequest{RecipeID: 100}); err != nil {
+		t.Fatalf("Adapt() after fixing the request error = %v", err)
+	}
+	if got := len(h.worker.queue); got != 1 {
+		t.Errorf("queued tasks = %d, want 1", got)
 	}
 }
 
