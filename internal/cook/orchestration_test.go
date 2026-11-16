@@ -294,6 +294,10 @@ func TestWorkerFallsBackImmediatelyOnUnusableModelOutput(t *testing.T) {
 	if h.llm.calls != 1 {
 		t.Errorf("llm calls = %d, want 1: a 422 must not be retried", h.llm.calls)
 	}
+	// The reason is shown to the user, so it names no internal service (§7).
+	if job.Result.FallbackReason == "" || strings.Contains(job.Result.FallbackReason, "llm-service") {
+		t.Errorf("FallbackReason = %q, want a user-facing explanation without internal service names", job.Result.FallbackReason)
+	}
 }
 
 // Failed runs are the ones worth analysing, so the metadata llm-service sends

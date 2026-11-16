@@ -239,7 +239,7 @@ func (w *Worker) run(ctx context.Context, log *slog.Logger, t task) {
 			// unadapted instead of burning another slow generation.
 			case errors.Is(err, ErrModelUnusable):
 				w.serveFallback(ctx, log, t, job, ac.HaveIDs,
-					"llm-service could not produce a usable answer for this recipe")
+					"the recipe model could not produce a usable answer for this recipe")
 				return
 			}
 			lastReason = "the adaptation call failed"
