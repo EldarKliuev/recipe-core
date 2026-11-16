@@ -1,0 +1,45 @@
+# Runs the same make targets as a local check (CLAUDE.md §6.6), so CI and a
+# developer's machine cannot disagree about what "green" means.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Lint
+        run: make lint
+
+      - name: Unit tests
+        run: make test
+
+      # make test-integration expects the compose Postgres, exactly as locally.
+      # .env comes from .env.example; nothing here starts core-api, so its
+      # placeholder JWT_SECRET is never used.
+      - name: Start Postgres
+        run: |
+          make bootstrap
+          docker compose up -d --wait postgres
+
+      # Fails on any skipped test: a skip here means the database was not reached
+      # and the allergen and ranking tests proved nothing.
+      - name: Integration tests
+        run: make test-integration
