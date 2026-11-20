@@ -73,3 +73,34 @@ func TestLoadRejectsAShortSecret(t *testing.T) {
 		t.Fatal("Load accepted a 31-byte JWT_SECRET")
 	}
 }
+
+func TestLoadIgnoresForwardedForByDefault(t *testing.T) {
+	setRequiredEnv(t, strings.Repeat("s", 32))
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TrustedProxyHops != 0 {
+		t.Errorf("TrustedProxyHops = %d, want 0 when TRUSTED_PROXY_HOPS is unset", cfg.TrustedProxyHops)
+	}
+}
+
+func TestLoadReadsTrustedProxyHops(t *testing.T) {
+	setRequiredEnv(t, strings.Repeat("s", 32))
+	t.Setenv("TRUSTED_PROXY_HOPS", "1")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TrustedProxyHops != 1 {
+		t.Errorf("TrustedProxyHops = %d, want 1", cfg.TrustedProxyHops)
+	}
+}
+
+func TestLoadRejectsNegativeTrustedProxyHops(t *testing.T) {
+	setRequiredEnv(t, strings.Repeat("s", 32))
+	t.Setenv("TRUSTED_PROXY_HOPS", "-1")
+	if _, err := Load(); err == nil {
+		t.Error("Load accepted TRUSTED_PROXY_HOPS=-1")
+	}
+}

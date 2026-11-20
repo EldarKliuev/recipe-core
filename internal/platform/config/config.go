@@ -39,6 +39,10 @@ type Config struct {
 	// AuthRateLimit is the number of auth attempts allowed per window per IP.
 	AuthRateLimit       int
 	AuthRateLimitWindow time.Duration
+	// TrustedProxyHops is how many reverse proxies in front of the service append
+	// to X-Forwarded-For. 0 means the service is reached directly and the header
+	// is ignored, since the client can write anything into it.
+	TrustedProxyHops int
 }
 
 func Load() (Config, error) {
@@ -76,6 +80,13 @@ func Load() (Config, error) {
 	}
 	if cfg.AdaptQueueSize, err = envInt("ADAPT_QUEUE_SIZE", 64); err != nil {
 		return cfg, err
+	}
+
+	if cfg.TrustedProxyHops, err = envInt("TRUSTED_PROXY_HOPS", 0); err != nil {
+		return cfg, err
+	}
+	if cfg.TrustedProxyHops < 0 {
+		return cfg, fmt.Errorf("TRUSTED_PROXY_HOPS must not be negative")
 	}
 
 	if cfg.DatabaseURL == "" {

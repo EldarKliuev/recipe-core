@@ -88,7 +88,7 @@ func quietLogger() *slog.Logger {
 
 func TestRateLimiterBlocksAfterTheLimit(t *testing.T) {
 	counter := &fakeCounter{counts: map[string]int64{}}
-	limiter := NewRateLimiter(counter, 3, time.Minute, quietLogger())
+	limiter := NewRateLimiter(counter, 3, time.Minute, 0, quietLogger())
 	handler := limiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -113,7 +113,7 @@ func TestRateLimiterBlocksAfterTheLimit(t *testing.T) {
 
 func TestRateLimiterCountsPerClient(t *testing.T) {
 	counter := &fakeCounter{counts: map[string]int64{}}
-	limiter := NewRateLimiter(counter, 1, time.Minute, quietLogger())
+	limiter := NewRateLimiter(counter, 1, time.Minute, 0, quietLogger())
 	handler := limiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 
 	first := httptest.NewRecorder()
@@ -129,7 +129,7 @@ func TestRateLimiterCountsPerClient(t *testing.T) {
 // Redis being down must not lock users out of logging in.
 func TestRateLimiterFailsOpenWhenRedisIsDown(t *testing.T) {
 	counter := &fakeCounter{counts: map[string]int64{}, err: errors.New("redis is down")}
-	limiter := NewRateLimiter(counter, 1, time.Minute, quietLogger())
+	limiter := NewRateLimiter(counter, 1, time.Minute, 0, quietLogger())
 
 	called := false
 	handler := limiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +141,57 @@ func TestRateLimiterFailsOpenWhenRedisIsDown(t *testing.T) {
 	if !called {
 		t.Error("request was blocked while Redis was unavailable, want fail-open")
 	}
+}
+
+// Without a trusted proxy X-Forwarded-For is written by the client, so changing
+// it must not give a fresh window.
+func TestRateLimiterIgnoresForwardedForWithoutATrustedProxy(t *testing.T) {
+	codes := attempts(0, "203.0.113.7:1234", "198.51.100.1", "198.51.100.2")
+	if codes[1] != http.StatusTooManyRequests {
+		t.Errorf("second attempt with a new X-Forwarded-For got %d, want 429", codes[1])
+	}
+}
+
+// Behind nginx ($proxy_add_x_forwarded_for) the client can still prepend
+// anything; only the entry the proxy appended identifies it.
+func TestRateLimiterIgnoresClientWrittenEntriesBehindAProxy(t *testing.T) {
+	codes := attempts(1, "172.18.0.5:40000",
+		"198.51.100.1, 203.0.113.7", "198.51.100.2, 203.0.113.7")
+	if codes[1] != http.StatusTooManyRequests {
+		t.Errorf("second attempt with a new spoofed entry got %d, want 429", codes[1])
+	}
+}
+
+func TestRateLimiterCountsClientsBehindAProxySeparately(t *testing.T) {
+	codes := attempts(1, "172.18.0.5:40000", "203.0.113.7", "198.51.100.2")
+	if codes[1] != http.StatusOK {
+		t.Errorf("a different client behind the proxy got %d, want 200; all clients share the proxy's window", codes[1])
+	}
+}
+
+// A header shorter than the number of trusted proxies did not pass through all
+// of them, so it is entirely client-written and the peer address is counted.
+func TestRateLimiterIgnoresAHeaderShorterThanTheTrustedHops(t *testing.T) {
+	codes := attempts(2, "172.18.0.5:40000", "198.51.100.1", "198.51.100.2")
+	if codes[1] != http.StatusTooManyRequests {
+		t.Errorf("second attempt with a new short header got %d, want 429", codes[1])
+	}
+}
+
+// attempts sends one login per X-Forwarded-For value from the same peer through
+// a limiter that allows a single attempt, and returns the status codes.
+func attempts(trustedHops int, remoteAddr string, forwardedFor ...string) []int {
+	limiter := NewRateLimiter(&fakeCounter{counts: map[string]int64{}}, 1, time.Minute, trustedHops, quietLogger())
+	handler := limiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	codes := make([]int, 0, len(forwardedFor))
+	for _, fwd := range forwardedFor {
+		req := loginRequest(remoteAddr)
+		req.Header.Set("X-Forwarded-For", fwd)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		codes = append(codes, rec.Code)
+	}
+	return codes
 }
 
 func loginRequest(remoteAddr string) *http.Request {
