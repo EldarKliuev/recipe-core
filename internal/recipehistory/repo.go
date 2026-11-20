@@ -2,9 +2,11 @@ package recipehistory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/recipe-ai/core-api/internal/platform/httpx"
 )
@@ -55,11 +57,22 @@ type ListItem struct {
 	BaseTitle string `json:"base_title"`
 }
 
-func (r *Repo) List(ctx context.Context, userID uuid.UUID, limit, offset int) ([]ListItem, error) {
-	rows, err := r.pool.Query(ctx, `
+// historySelect reads history rows with the corpus title of their base recipe.
+// Every caller adds a user_id condition: an entry id alone grants nothing.
+const historySelect = `
 SELECT ar.id, ar.base_recipe_id, ar.result, ar.model, ar.adapted, ar.rating, ar.created_at, rc.title
 FROM adapted_recipes ar
-JOIN recipes rc ON rc.id = ar.base_recipe_id
+JOIN recipes rc ON rc.id = ar.base_recipe_id`
+
+func scanListItem(row pgx.Row) (ListItem, error) {
+	var it ListItem
+	err := row.Scan(&it.ID, &it.BaseRecipeID, &it.Result, &it.Model,
+		&it.Adapted, &it.Rating, &it.CreatedAt, &it.BaseTitle)
+	return it, err
+}
+
+func (r *Repo) List(ctx context.Context, userID uuid.UUID, limit, offset int) ([]ListItem, error) {
+	rows, err := r.pool.Query(ctx, historySelect+`
 WHERE ar.user_id = $1
 ORDER BY ar.created_at DESC
 LIMIT $2 OFFSET $3`, userID, limit, offset)
@@ -70,14 +83,27 @@ LIMIT $2 OFFSET $3`, userID, limit, offset)
 
 	items := []ListItem{}
 	for rows.Next() {
-		var it ListItem
-		if err := rows.Scan(&it.ID, &it.BaseRecipeID, &it.Result, &it.Model,
-			&it.Adapted, &it.Rating, &it.CreatedAt, &it.BaseTitle); err != nil {
+		it, err := scanListItem(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan history item: %w", err)
 		}
 		items = append(items, it)
 	}
 	return items, rows.Err()
+}
+
+// Get returns one of the user's entries. Another user's entry is reported as
+// not found, the same as a missing one, so ids cannot be probed.
+func (r *Repo) Get(ctx context.Context, userID, adaptedID uuid.UUID) (ListItem, error) {
+	it, err := scanListItem(r.pool.QueryRow(ctx, historySelect+`
+WHERE ar.id = $1 AND ar.user_id = $2`, adaptedID, userID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ListItem{}, fmt.Errorf("%w: adapted recipe %s", httpx.ErrNotFound, adaptedID)
+	}
+	if err != nil {
+		return ListItem{}, fmt.Errorf("select history item: %w", err)
+	}
+	return it, nil
 }
 
 func (r *Repo) SetRating(ctx context.Context, userID, adaptedID uuid.UUID, rating int16) error {

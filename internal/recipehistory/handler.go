@@ -12,6 +12,7 @@ import (
 
 type store interface {
 	List(ctx context.Context, userID uuid.UUID, limit, offset int) ([]ListItem, error)
+	Get(ctx context.Context, userID, adaptedID uuid.UUID) (ListItem, error)
 	SetRating(ctx context.Context, userID, adaptedID uuid.UUID, rating int16) error
 }
 
@@ -26,6 +27,7 @@ func NewHandler(s store) *Handler {
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", h.list)
+	r.Get("/{adaptedID}", h.get)
 	r.Post("/{adaptedID}/rating", h.rate)
 	return r
 }
@@ -56,6 +58,25 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, listResponse{Items: items})
+}
+
+func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
+	userID, err := authctx.UserID(r.Context())
+	if err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	adaptedID, err := uuid.Parse(chi.URLParam(r, "adaptedID"))
+	if err != nil {
+		httpx.Fail(w, r, httpx.Invalidf("adaptedID must be a uuid"))
+		return
+	}
+	item, err := h.store.Get(r.Context(), userID, adaptedID)
+	if err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, item)
 }
 
 type ratingRequest struct {
