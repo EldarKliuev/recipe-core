@@ -261,6 +261,28 @@ paths:
                     items: { $ref: "#/components/schemas/HistoryItem" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /api/v1/me/history/{adaptedID}:
+    get:
+      tags: [me]
+      summary: Get one past adaptation
+      description: |
+        adaptedID is the `id` of the job's `AdaptedResult`. Another user's entry
+        answers 404, the same as a missing one.
+      parameters:
+        - name: adaptedID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The history entry
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HistoryItem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v1/me/history/{adaptedID}/rating:
     post:
       tags: [me]

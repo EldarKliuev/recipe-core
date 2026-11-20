@@ -105,3 +105,46 @@ func TestRatingAnUnknownEntryIsNotFound(t *testing.T) {
 		t.Fatalf("SetRating() error = %v, want ErrNotFound", err)
 	}
 }
+
+func TestOwnHistoryEntryIsReadableByID(t *testing.T) {
+	pool, cleanup := pgtest.Pool(t)
+	defer cleanup()
+	repo := NewRepo(pool)
+	owner := pgtest.User(t, pool)
+	entry := savedEntry(t, pool, repo, owner)
+
+	got, err := repo.Get(context.Background(), owner, entry.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.ID != entry.ID || got.BaseRecipeID != entry.BaseRecipeID ||
+		got.BaseTitle != "Pancakes" || !got.Adapted || string(got.Result) != `{"title": "Pancakes"}` {
+		t.Errorf("Get() = %+v, want the saved entry with its corpus title", got)
+	}
+}
+
+func TestAnotherUsersHistoryEntryIsNotReadableByID(t *testing.T) {
+	pool, cleanup := pgtest.Pool(t)
+	defer cleanup()
+	repo := NewRepo(pool)
+	owner, other := pgtest.User(t, pool), pgtest.User(t, pool)
+	entry := savedEntry(t, pool, repo, owner)
+
+	got, err := repo.Get(context.Background(), other, entry.ID)
+	if !errors.Is(err, httpx.ErrNotFound) {
+		t.Fatalf("Get() by another user = %+v, %v; want ErrNotFound (404)", got, err)
+	}
+}
+
+func TestUnknownHistoryEntryIsNotFound(t *testing.T) {
+	pool, cleanup := pgtest.Pool(t)
+	defer cleanup()
+	repo := NewRepo(pool)
+	owner := pgtest.User(t, pool)
+	savedEntry(t, pool, repo, owner)
+
+	_, err := repo.Get(context.Background(), owner, uuid.New())
+	if !errors.Is(err, httpx.ErrNotFound) {
+		t.Fatalf("Get() error = %v, want ErrNotFound", err)
+	}
+}
