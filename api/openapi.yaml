@@ -428,6 +428,37 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /api/v1/cook/recipes/{recipeID}:
+    get:
+      tags: [cook]
+      summary: One recipe as a match against the current fridge
+      description: |
+        The same set-coverage as `POST /cook/matches`, for one recipe, so a client
+        can reopen a recipe card without repeating the search. `have` and
+        `missing` are measured against the fridge now, so `missing` may have grown
+        since the search. The search filters (`categories`, `max_steps`,
+        `max_ingredients`) do not apply; the recipe is accepted with up to 10
+        missing ingredients, the same bound `POST /cook/adapt` uses for a chosen
+        `recipe_id`.
+
+        404 when the recipe does not exist, uses none of the fridge, is missing
+        more than 10 ingredients, or contains a denied allergen or a disliked
+        ingredient. Corpus directions are never returned.
+      parameters:
+        - name: recipeID
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: The recipe as a match
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Match" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v1/cook/adapt:
     post:
       tags: [cook]
