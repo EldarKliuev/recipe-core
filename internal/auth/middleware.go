@@ -56,16 +56,19 @@ type RateLimiter struct {
 	counter counter
 	limit   int
 	window  time.Duration
-	log     *slog.Logger
+	// trustedHops is how many reverse proxies in front of the service append to
+	// X-Forwarded-For; see clientIP.
+	trustedHops int
+	log         *slog.Logger
 }
 
-func NewRateLimiter(c counter, limit int, window time.Duration, log *slog.Logger) *RateLimiter {
-	return &RateLimiter{counter: c, limit: limit, window: window, log: log}
+func NewRateLimiter(c counter, limit int, window time.Duration, trustedHops int, log *slog.Logger) *RateLimiter {
+	return &RateLimiter{counter: c, limit: limit, window: window, trustedHops: trustedHops, log: log}
 }
 
 func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := fmt.Sprintf("ratelimit:auth:%s:%d", clientIP(r), time.Now().UnixNano()/int64(l.window))
+		key := fmt.Sprintf("ratelimit:auth:%s:%d", clientIP(r, l.trustedHops), time.Now().UnixNano()/int64(l.window))
 		res := l.counter.Incr(r.Context(), key)
 		if res.Err != nil {
 			l.log.WarnContext(r.Context(), "rate limiter unavailable, allowing request",
@@ -93,14 +96,26 @@ type IntResult struct {
 	Err   error
 }
 
-func clientIP(r *http.Request) string {
-	// Only the leftmost X-Forwarded-For entry is meaningful, and only because
-	// this service sits behind a trusted proxy in deployment.
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		if first, _, ok := strings.Cut(fwd, ","); ok {
-			return strings.TrimSpace(first)
+// clientIP returns the address the limiter counts attempts against. Every
+// X-Forwarded-For entry except those appended by our own proxies is written by
+// the client, so with trustedHops proxies in front the client is the
+// trustedHops-th entry from the right (nginx's $proxy_add_x_forwarded_for appends
+// the peer it saw). With no trusted proxies the header is ignored entirely. A
+// header shorter than trustedHops did not pass through all of them, so it is not
+// trusted either and the peer address is used.
+func clientIP(r *http.Request, trustedHops int) string {
+	if trustedHops > 0 {
+		var entries []string
+		for _, h := range r.Header.Values("X-Forwarded-For") {
+			for _, e := range strings.Split(h, ",") {
+				entries = append(entries, strings.TrimSpace(e))
+			}
 		}
-		return strings.TrimSpace(fwd)
+		if len(entries) >= trustedHops {
+			if ip := entries[len(entries)-trustedHops]; ip != "" {
+				return ip
+			}
+		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

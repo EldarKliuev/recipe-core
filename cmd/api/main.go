@@ -80,7 +80,7 @@ func run() error {
 
 	tokens := auth.NewTokenIssuer([]byte(cfg.JWTSecret), cfg.JWTAccessTTL, cfg.JWTRefreshTTL)
 	rateLimiter := auth.NewRateLimiter(
-		auth.NewRedisCounter(redisConn), cfg.AuthRateLimit, cfg.AuthRateLimitWindow, log)
+		auth.NewRedisCounter(redisConn), cfg.AuthRateLimit, cfg.AuthRateLimitWindow, cfg.TrustedProxyHops, log)
 
 	handler := api.NewRouter(api.Deps{
 		Config:      cfg,
