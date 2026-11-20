@@ -443,9 +443,31 @@ def cmd_load(args: argparse.Namespace) -> int:
             if target in name_to_id:
                 resolution.setdefault(synonym, name_to_id[target])
 
+        # The deny-list also reads the ids the directions name, because part of the
+        # corpus lists fewer ingredients than the steps use (TASK-40).
+        vocabulary = allergen_rules.step_vocabulary(resolution)
+        tags_of = {name_to_id[name]: tags for name, tags in reviewed.items()
+                   if name in name_to_id and tags}
+        step_only: collections.Counter[str] = collections.Counter()
+        step_only_recipes = 0
+
+        def with_step_ids() -> Iterator[dict[str, Any]]:
+            nonlocal step_only_recipes
+            for record in _read_parsed():
+                mentioned = allergen_rules.step_ingredient_ids(record["directions"], vocabulary)
+                listed = [resolution[line["name"]] for line in record["lines"]
+                          if line["name"] in resolution]
+                extra = allergen_rules.step_only_allergens(listed, mentioned, tags_of)
+                if extra:
+                    step_only_recipes += 1
+                    step_only.update(extra)
+                yield {**record, "step_ingredient_ids": mentioned}
+
         print("loading recipes")
-        recipes, links = db.load_recipes(conn, _read_parsed(), resolution, args.batch_size)
+        recipes, links = db.load_recipes(conn, with_step_ids(), resolution, args.batch_size)
         print(f"loaded {recipes} recipes and {links} ingredient links")
+        print(f"recipes whose steps add an allergen the list lacks: {step_only_recipes}"
+              + (f" ({_counts(step_only)})" if step_only else ""))
 
         db.refresh_num_ingredients(conn)
         print("aligned recipes.num_ingredients with resolved links")

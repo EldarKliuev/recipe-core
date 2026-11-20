@@ -17,6 +17,8 @@ import re
 from pathlib import Path
 from typing import Container, Iterable, Mapping
 
+from .parser import normalise_unicode, singularise
+
 # Same order as user.KnownAllergens, which is also the order tags are proposed in.
 ALLERGENS: tuple[str, ...] = (
     "dairy", "eggs", "fish", "shellfish", "tree_nuts", "peanuts",
@@ -366,6 +368,68 @@ def synonyms_losing_allergens(synonyms: Mapping[str, str],
         if not set(tag(name)) <= have:
             lost[name] = target
     return lost
+
+
+StepVocabulary = dict[tuple[str, ...], int]
+
+# The same characters parser._clean_name keeps, so step words and catalog names
+# are split and singularised the same way ("cookies" and "cooky", "baker's").
+_STEP_NON_WORD = re.compile(r"[^a-z0-9\s\-']")
+
+
+# Bare names that in directions almost always mean a part of the dish being made
+# ("pour the sauce over", "roll the dough", "cream the butter"), not an ingredient
+# the list left out. `sauce` and `seasoning` carry all 13 tags (TASK-01), so
+# reading them in the steps hid about 8 000 recipes from every allergic user.
+# Only the bare words are skipped: "soy sauce", "ice cream" and "pie pastry" are
+# longer names and still resolve with their tags.
+STEP_GENERIC_NAMES = frozenset({
+    "sauce", "seasoning", "roll", "dough", "crust", "pastry", "cream",
+})
+
+
+def step_vocabulary(names: Mapping[str, int]) -> StepVocabulary:
+    """Index resolvable names (canonical and synonyms) by their words."""
+    return {tuple(name.split()): ident for name, ident in names.items()
+            if name.strip() and name not in STEP_GENERIC_NAMES}
+
+
+def step_ingredient_ids(directions: Iterable[str], vocabulary: StepVocabulary) -> list[int]:
+    """Return the sorted catalog ids that recipe directions name.
+
+    Part of the corpus lists fewer ingredients than the steps use, and the SQL
+    deny-list reads these ids next to the listed ones. A mention counts whether
+    it is a truncated list or "grease with butter": telling them apart is a guess,
+    and a spurious id only hides a recipe from a user allergic to it.
+
+    Matching works on catalog names, not on allergen keywords, so the result is
+    ids whose tags the database holds. At each word the longest name wins and
+    consumes its words, so "coconut milk" is not read as "milk" when the catalog
+    has both, the same way `tag` lets a phrase hide its parts.
+    """
+    longest = max((len(key) for key in vocabulary), default=0)
+    found: set[int] = set()
+    for step in directions:
+        text = _STEP_NON_WORD.sub(" ", normalise_unicode(str(step)).lower())
+        words = [singularise(w) for w in text.split()]
+        i = 0
+        while i < len(words):
+            for size in range(min(longest, len(words) - i), 0, -1):
+                ident = vocabulary.get(tuple(words[i:i + size]))
+                if ident is not None:
+                    found.add(ident)
+                    i += size
+                    break
+            else:
+                i += 1
+    return sorted(found)
+
+
+def step_only_allergens(listed: Iterable[int], mentioned: Iterable[int],
+                        tags_of: Mapping[int, Iterable[str]]) -> set[str]:
+    """Allergens the steps add that no listed ingredient carries."""
+    have = {t for ident in listed for t in tags_of.get(ident, ())}
+    return {t for ident in mentioned for t in tags_of.get(ident, ())} - have
 
 
 REVIEW_COLUMNS = ["canonical_name", "allergens", "occurrences", "confirmed"]

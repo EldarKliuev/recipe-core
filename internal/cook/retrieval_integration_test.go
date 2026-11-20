@@ -323,6 +323,70 @@ func TestSetCoverageRespectsMaxMissingAndComplexityFilters(t *testing.T) {
 	}
 }
 
+// Part of the corpus lists fewer ingredients than its steps use (TASK-40), so the
+// deny-list also reads the ids ingest found in the directions. Coverage must not:
+// a user without the allergy still sees the recipe, counted by its list alone.
+func TestSetCoverageExcludesAnAllergenNamedOnlyInTheSteps(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	ctx := context.Background()
+	repo := NewRetrievalRepo(pool)
+
+	var truncated int64
+	if err := pool.QueryRow(ctx, `
+INSERT INTO recipes (external_id, title, category, steps, num_ingredients, num_steps, source,
+                     step_ingredient_ids)
+VALUES ('truncated', 'Truncated pasta', 'test',
+        '["Boil the pasta.", "Toss with tomato and parmesan."]'::jsonb, 2, 2, 'test',
+        ARRAY[$1, $2, $3]::int[])
+RETURNING id`, seed.pastaID, seed.tomatoID, seed.parmesanID).Scan(&truncated); err != nil {
+		t.Fatalf("insert recipe: %v", err)
+	}
+	for _, ingredient := range []int64{seed.pastaID, seed.tomatoID} {
+		if _, err := pool.Exec(ctx, `
+INSERT INTO recipe_ingredients (recipe_id, ingredient_id, raw_text) VALUES ($1, $2, 'x')`,
+			truncated, ingredient); err != nil {
+			t.Fatalf("link ingredient: %v", err)
+		}
+	}
+
+	find := func(allergens []string) *coverageRow {
+		t.Helper()
+		rows, err := repo.Coverage(ctx, Query{UserID: seed.userID, Allergens: allergens,
+			MaxMissing: 0, Limit: 50, UseSoonBefore: time.Now()})
+		if err != nil {
+			t.Fatalf("Coverage() error = %v", err)
+		}
+		for i := range rows {
+			if rows[i].RecipeID == truncated {
+				return &rows[i]
+			}
+		}
+		return nil
+	}
+
+	row := find(nil)
+	if row == nil {
+		t.Fatal("without allergies the recipe is missing: step ids must not count as missing")
+	}
+	if row.TotalCount != 2 {
+		t.Errorf("total_count = %d, want the 2 listed ingredients only", row.TotalCount)
+	}
+	if find([]string{"dairy"}) != nil {
+		t.Fatal("a recipe whose steps name parmesan was returned for a dairy-allergic user")
+	}
+
+	q := Query{UserID: seed.userID, MaxMissing: maxMaxMissing, UseSoonBefore: time.Now()}
+	if ok, err := repo.IsRetrievableFor(ctx, q, truncated); err != nil || !ok {
+		t.Fatalf("IsRetrievableFor() without allergies = %v, %v; want true", ok, err)
+	}
+	q.Allergens = []string{"dairy"}
+	if ok, err := repo.IsRetrievableFor(ctx, q, truncated); err != nil || ok {
+		t.Fatalf("IsRetrievableFor() for a dairy-allergic user = %v, %v; want false", ok, err)
+	}
+}
+
 func TestIsRetrievableForGuardsAdaptation(t *testing.T) {
 	pool, cleanup := testPool(t)
 	defer cleanup()
@@ -423,6 +487,9 @@ type corpusSeed struct {
 	chickenID   int64
 	basilID     int64
 	saltID      int64
+	pastaID     int64
+	tomatoID    int64
+	parmesanID  int64
 }
 
 // testPool keeps the name every cook integration test already uses; the
@@ -457,6 +524,9 @@ func seedCorpus(t *testing.T, pool *pgxpool.Pool) corpusSeed {
 	seed.chickenID = id("chicken breast")
 	seed.basilID = id("basil")
 	seed.saltID = id("salt")
+	seed.pastaID = id("pasta")
+	seed.tomatoID = id("tomato")
+	seed.parmesanID = id("parmesan")
 
 	// Salt is a staple, so it must not count as missing anywhere.
 	if _, err := pool.Exec(ctx,

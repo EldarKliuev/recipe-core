@@ -200,5 +200,46 @@ class SynonymsLosingAllergensTest(unittest.TestCase):
                          {"salted butter": "butter"})
 
 
+class StepIngredientIdsTest(unittest.TestCase):
+    NAMES = {"butter": 1, "all-purpose flour": 2, "flour": 3, "egg": 4,
+             "milk": 5, "coconut milk": 6, "cocoa powder": 7, "cooky": 8,
+             "unsalted butter": 1, "sauce": 9, "soy sauce": 10, "cream": 11,
+             "ice cream": 11, "dough": 12}
+
+    def ids(self, *steps: str) -> list[int]:
+        return allergens.step_ingredient_ids(steps, allergens.step_vocabulary(self.NAMES))
+
+    def test_the_truncated_red_velvet_steps_name_flour_and_eggs(self) -> None:
+        # kaggle64k-10059 lists only "1 teaspoon butter".
+        self.assertEqual(self.ids(
+            "Grease an 8x8 baking dish with 1 teaspoon butter.",
+            "Add vanilla, cocoa powder, salt, food coloring, vinegar, and eggs.",
+            "Stir flour into sugar mixture until batter is just combined.",
+        ), [1, 3, 4, 7])
+
+    def test_longest_name_consumes_its_words(self) -> None:
+        self.assertEqual(self.ids("Stir in the coconut milk."), [6])
+        self.assertEqual(self.ids("Whisk the all-purpose flour with milk."), [2, 5])
+
+    def test_plurals_and_synonyms_resolve_like_ingredient_lines(self) -> None:
+        self.assertEqual(self.ids("Crumble the cookies over the top."), [8])
+        self.assertEqual(self.ids("Melt the unsalted butter."), [1])
+
+    def test_bare_dish_parts_are_skipped_but_longer_names_are_not(self) -> None:
+        self.assertEqual(self.ids("Pour the sauce over and roll the dough.",
+                                  "Cream the butter."), [1])
+        self.assertEqual(self.ids("Drizzle with soy sauce, serve with ice cream."), [10, 11])
+
+    def test_words_are_not_matched_inside_other_words(self) -> None:
+        self.assertEqual(self.ids("Top with buttermilk dressing and eggplant."), [])
+        self.assertEqual(self.ids(), [])
+
+    def test_step_only_allergens_skip_tags_a_listed_ingredient_has(self) -> None:
+        tags_of = {1: ("dairy",), 3: ("wheat", "gluten"), 5: ("dairy",)}
+        self.assertEqual(allergens.step_only_allergens([1], [1, 3, 5], tags_of),
+                         {"wheat", "gluten"})
+        self.assertEqual(allergens.step_only_allergens([1, 3], [3, 5], tags_of), set())
+
+
 if __name__ == "__main__":
     unittest.main()
