@@ -100,6 +100,17 @@ test-integration: test-db ## Run integration tests against a throwaway database;
 		fi; \
 		exit $$status
 
+# The benchmark needs the ingested corpus, so unlike the integration tests it runs
+# against the dev database. It never runs DDL: it adds throwaway users and deletes
+# them. -run '^$$' keeps the integration tests (which reset a schema) out of it.
+BENCH_DATABASE_URL ?= $(LOCAL_DATABASE_URL)
+BENCH_ITERATIONS ?= 200
+
+.PHONY: bench-search
+bench-search: ## Measure search latency (p50/p95) on the ingested corpus
+	BENCH_DATABASE_URL="$(BENCH_DATABASE_URL)" go test -tags=integration -count=1 \
+		-run '^$$' -bench BenchmarkSearch -benchtime=$(BENCH_ITERATIONS)x ./internal/cook
+
 .PHONY: lint
 lint: ## Vet and gofmt check
 	go vet ./...
