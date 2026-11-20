@@ -140,3 +140,39 @@ HashAggregate spills to disk in 5 batches with 4MB `work_mem`. The allergen
 tagged ingredients. Indexes are not the issue: the plan reads most of the table
 on purpose. The next step is the denormalisation described at `setCoverageSQL`
 (TASK-39).
+
+### 2026-11-20, after TASK-39
+
+Same database, settings and machine. Migration `00007` adds
+`recipes.ingredient_ids int[]`, a copy of the `recipe_ingredients` links kept in
+step by statement-level triggers, and the `intarray` extension. `setCoverageSQL`
+counts coverage with `icount` and `&` on that array and excludes allergens and
+dislikes by overlap with ids read from `ingredient_allergens` on every call, so
+allergen tags are not copied anywhere.
+
+| Fridge | Allergens | `Coverage` p50 / p95, ms | `Matches` p50 / p95, ms |
+|---|---|---|---|
+| 5 | — | 28 / 31 | 29 / 32 |
+| 5 | gluten, dairy | 29 / 30 | 30 / 32 |
+| 15 | — | 40 / 42 | 43 / 45 |
+| 15 | gluten, dairy | 41 / 44 | 41 / 44 |
+| 40 | — | 62 / 68 | 65 / 72 |
+| 40 | gluten, dairy | 64 / 68 | 65 / 71 |
+
+The target is met in every scenario. What it took:
+
+- Counting through `unnest` instead of `intarray` cost a subquery per candidate
+  recipe (~1.6 µs × 56 836) and stayed at 150–280 ms.
+- `intarray` sorts both operands on every call. Postgres' sort returns at once
+  on sorted input, so the stored arrays and every array the query builds are
+  sorted. With an unsorted deny-list (265 ids for `gluten` + `dairy`) the
+  allergen overlap alone took ~190 ms.
+
+Arrays are int4 because `intarray` is; catalog ids are `bigint`. The trigger
+casts and so refuses a link whose id does not fit, and the query leaves such ids
+out of the fridge and dislike arrays instead of failing.
+
+Not measured: how much the triggers slow down `load`. `executemany` sends one
+statement per link, so each link updates its recipe's array once; for the
+~530 000 links of a full load that is the same number of `UPDATE recipes`.
+Repeat this benchmark after the corpus reload (TASK-21).

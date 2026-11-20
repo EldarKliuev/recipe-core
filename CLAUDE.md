@@ -98,7 +98,7 @@ git fetch origin main -q && git diff --name-only origin/main...HEAD
 ## 4. Стек и архитектурные рамки
 
 - Go 1.26, chi, pgx (SQL руками, без ORM), goose, go-redis, `log/slog`, JWT + argon2id; тесты — `testing`, `testcontainers-go`, `miniredis`, `httptest`
-- PostgreSQL — единственное постоянное хранилище; Redis — состояние задач, ключи идемпотентности, rate limit
+- PostgreSQL — единственное постоянное хранилище, из расширений только `intarray` (покрытие в поиске, миграция `00007`); Redis — состояние задач, ключи идемпотентности, rate limit
 - Образ: `dev` — air с hot reload, `prod` — статический бинарник на distroless
 
 **Модульный монолит:** один бинарник, одна база. Сборка зависимостей — в `cmd/api/main.go`, маршруты — в `internal/api/router.go`. Пакеты `auth`, `user`, `inventory`, `catalog`, `cook`, `recipehistory` устроены как handler → service → repo. Интерфейсы объявляет **потребитель**, а не реализация.
