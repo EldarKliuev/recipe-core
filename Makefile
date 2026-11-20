@@ -88,10 +88,12 @@ test-db: ## Create the throwaway integration-test database (idempotent)
 
 # Integration tests skip themselves when they cannot reach Postgres, and a green
 # run with skips proves nothing, so any skip fails the target (here and in CI).
+# -p 1: every package resets the schema of the same database, so packages must
+# not run at the same time.
 .PHONY: test-integration
 test-integration: test-db ## Run integration tests against a throwaway database; fails on skips
 	@set -o pipefail; out=$$(mktemp); trap 'rm -f "$$out"' EXIT; \
-		TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -tags=integration -count=1 -v ./... | tee "$$out"; \
+		TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -tags=integration -count=1 -p 1 -v ./... | tee "$$out"; \
 		status=$$?; \
 		if grep -q -- '--- SKIP' "$$out"; then \
 			echo; echo "integration tests were skipped:"; grep -- '--- SKIP' "$$out"; exit 1; \
