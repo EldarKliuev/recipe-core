@@ -145,6 +145,32 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "429": { $ref: "#/components/responses/TooManyRequests" }
 
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Log out this device
+      description: |
+        Revokes the presented refresh token so a copy of it stops working. Needs
+        the access token as well: only the caller's own refresh token is revoked.
+        An unknown, foreign, expired or already revoked token is also 204, so the
+        response reveals nothing about it. The access token is not revocable; the
+        client drops it and it expires on its own. If the access token has
+        expired, refresh first. Shares the rate limit of the other auth endpoints.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "204": { description: Logged out }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
   /api/v1/me:
     delete:
       tags: [me]

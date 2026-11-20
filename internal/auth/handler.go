@@ -16,14 +16,17 @@ func NewHandler(svc *Service) *Handler {
 	return &Handler{svc: svc}
 }
 
-// Routes mounts the public auth endpoints. rateLimit is applied here rather than
-// globally because these are the only unauthenticated write endpoints.
-func (h *Handler) Routes(rateLimit func(http.Handler) http.Handler) http.Handler {
+// Routes mounts the auth endpoints. rateLimit is applied here rather than
+// globally because these are the only unauthenticated write endpoints. Logout
+// also needs requireAuth: the caller must be known, so that a refresh token of
+// someone else is not revoked.
+func (h *Handler) Routes(rateLimit, requireAuth func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
 	r.Use(rateLimit)
 	r.Post("/register", h.register)
 	r.Post("/login", h.login)
 	r.Post("/refresh", h.refresh)
+	r.With(requireAuth).Post("/logout", h.logout)
 	return r
 }
 
@@ -34,6 +37,24 @@ type credentialsRequest struct {
 
 type refreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
+}
+
+func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
+	userID, err := authctx.UserID(r.Context())
+	if err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	var req refreshRequest
+	if err := httpx.Decode(r, &req); err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	if err := h.svc.Logout(r.Context(), userID, req.RefreshToken); err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	httpx.NoContent(w)
 }
 
 type deleteAccountRequest struct {
