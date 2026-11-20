@@ -42,63 +42,73 @@ type coverageRow struct {
 
 // setCoverageSQL is the heart of the product.
 //
-// `have` is the fridge plus pantry staples. `candidates` narrows to recipes that
-// use at least one thing actually in the fridge: that is the product definition
-// of a match ("cook from what I have"), and it also keeps the aggregate off a
-// full scan of recipe_ingredients. Allergens and dislikes are excluded with NOT
-// EXISTS on canonical ids rather than by text matching, so an allergy cannot be
-// defeated by a spelling difference.
+// It reads recipes.ingredient_ids, a trigger-maintained int[] copy of the
+// recipe_ingredients links (migration 00007), and counts coverage with intarray's
+// C intersection (`&`, icount). Frequent fridge items make almost the whole corpus
+// a candidate, so the per-recipe count has to be cheap: the aggregate over the
+// link table, and later a subquery per recipe, kept p95 above 150 ms (TASK-39).
+//
+// `have` is the fridge plus pantry staples. A recipe is a candidate only if it uses
+// at least one thing actually in the fridge: that is the product definition of a
+// match ("cook from what I have"). Allergens and dislikes are excluded by overlap
+// on canonical ids rather than by text matching, so an allergy cannot be defeated
+// by a spelling difference. The denied ids come from ingredient_allergens on every
+// call, so the tags themselves are never copied and cannot go stale.
+//
+// Every array is built sorted. intarray sorts both operands on each call, and
+// Postgres' sort returns at once on sorted input, so an unsorted deny-list of a
+// few hundred ids made the allergen overlap the most expensive step of the query.
+//
+// The arrays are int4 because intarray is. The triggers refuse to store an id
+// that does not fit, so an id above that range is never in ingredient_ids and is
+// left out of the query arrays rather than cast into an error.
 //
 // Ranking is missing_count then total_count; the near-expiry count and step count
-// are tie-breakers below those. If this stops meeting the p95 < 150 ms target on
-// ~600k ingredient rows, the documented next step is denormalising into
-// recipes.ingredient_ids int[] with a GIN index and computing coverage with array
-// operators, not reaching for a vector index.
+// are tie-breakers below those.
 const setCoverageSQL = `
-WITH have AS (
-    SELECT ingredient_id FROM user_ingredients WHERE user_id = $1
-    UNION
-    SELECT ingredient_id FROM pantry_staples
+WITH fridge AS (
+    SELECT coalesce(array_agg(ingredient_id::int ORDER BY ingredient_id) FILTER (WHERE ingredient_id <= 2147483647), '{}') AS ids
+    FROM user_ingredients WHERE user_id = $1
+),
+have AS (
+    SELECT coalesce(array_agg(ingredient_id::int ORDER BY ingredient_id) FILTER (WHERE ingredient_id <= 2147483647), '{}') AS ids
+    FROM (
+        SELECT ingredient_id FROM user_ingredients WHERE user_id = $1
+        UNION
+        SELECT ingredient_id FROM pantry_staples
+    ) h
 ),
 use_soon AS (
-    SELECT ingredient_id FROM user_ingredients
+    SELECT coalesce(array_agg(ingredient_id::int ORDER BY ingredient_id) FILTER (WHERE ingredient_id <= 2147483647), '{}') AS ids
+    FROM user_ingredients
     WHERE user_id = $1 AND expires_at IS NOT NULL AND expires_at <= $8::date
 ),
-candidates AS (
-    SELECT DISTINCT ri.recipe_id
-    FROM user_ingredients ui
-    JOIN recipe_ingredients ri ON ri.ingredient_id = ui.ingredient_id
-    WHERE ui.user_id = $1
+denied AS (
+    SELECT coalesce(array_agg(ingredient_id::int ORDER BY ingredient_id) FILTER (WHERE ingredient_id <= 2147483647), '{}') AS ids
+    FROM ingredient_allergens WHERE allergen = ANY($2::text[])
+),
+disliked AS (
+    SELECT coalesce(array_agg(id::int ORDER BY id) FILTER (WHERE id <= 2147483647), '{}') AS ids
+    FROM unnest($7::bigint[]) id
 ),
 coverage AS (
-    SELECT ri.recipe_id,
-           count(*) AS total_count,
-           count(*) FILTER (WHERE h.ingredient_id IS NULL) AS missing_count,
-           count(*) FILTER (WHERE s.ingredient_id IS NOT NULL) AS use_soon_count
-    FROM candidates cand
-    JOIN recipe_ingredients ri ON ri.recipe_id = cand.recipe_id
-    LEFT JOIN have h ON h.ingredient_id = ri.ingredient_id
-    LEFT JOIN use_soon s ON s.ingredient_id = ri.ingredient_id
-    GROUP BY ri.recipe_id
-    HAVING count(*) FILTER (WHERE h.ingredient_id IS NULL) <= $3
+    SELECT r.id AS recipe_id, r.num_steps,
+           icount(r.ingredient_ids) AS total_count,
+           icount(r.ingredient_ids) - icount(r.ingredient_ids & have.ids) AS missing_count,
+           icount(r.ingredient_ids & use_soon.ids) AS use_soon_count
+    FROM recipes r, fridge, have, use_soon, denied, disliked
+    WHERE r.ingredient_ids && fridge.ids
+      AND ($4 <= 0 OR r.num_steps <= $4)
+      AND ($5 <= 0 OR r.num_ingredients <= $5)
+      AND (cardinality($6::text[]) = 0 OR r.category = ANY($6::text[]))
+      AND NOT (r.ingredient_ids && denied.ids)
+      AND NOT (r.ingredient_ids && disliked.ids)
 )
-SELECT cov.recipe_id, cov.total_count, cov.missing_count, cov.use_soon_count
-FROM coverage cov
-JOIN recipes r ON r.id = cov.recipe_id
-WHERE ($4 <= 0 OR r.num_steps <= $4)
-  AND ($5 <= 0 OR r.num_ingredients <= $5)
-  AND (cardinality($6::text[]) = 0 OR r.category = ANY($6::text[]))
-  AND NOT EXISTS (
-      SELECT 1 FROM recipe_ingredients x
-      JOIN ingredient_allergens a ON a.ingredient_id = x.ingredient_id
-      WHERE x.recipe_id = cov.recipe_id AND a.allergen = ANY($2::text[])
-  )
-  AND NOT EXISTS (
-      SELECT 1 FROM recipe_ingredients d
-      WHERE d.recipe_id = cov.recipe_id AND d.ingredient_id = ANY($7::bigint[])
-  )
-ORDER BY cov.missing_count ASC, cov.total_count ASC,
-         cov.use_soon_count DESC, r.num_steps ASC, r.id ASC
+SELECT recipe_id, total_count, missing_count, use_soon_count
+FROM coverage
+WHERE missing_count <= $3
+ORDER BY missing_count ASC, total_count ASC,
+         use_soon_count DESC, num_steps ASC, recipe_id ASC
 LIMIT $9`
 
 func (r *RetrievalRepo) Coverage(ctx context.Context, q Query) ([]coverageRow, error) {

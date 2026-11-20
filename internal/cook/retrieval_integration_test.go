@@ -114,6 +114,164 @@ func TestSetCoverageExcludesDeniedAllergens(t *testing.T) {
 	}
 }
 
+// Search reads a copy of the links in recipes.ingredient_ids, while the tags stay
+// in ingredient_allergens. A tag added after the recipe was loaded must apply at
+// once, with no reload or recompute.
+func TestSetCoverageExcludesAnAllergenTaggedAfterTheRecipeWasLoaded(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	ctx := context.Background()
+	repo := NewRetrievalRepo(pool)
+
+	var tomatoPasta int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM recipes WHERE title = 'Tomato pasta'`).
+		Scan(&tomatoPasta); err != nil {
+		t.Fatalf("find recipe: %v", err)
+	}
+	q := Query{UserID: seed.userID, Allergens: []string{"nightshade"},
+		MaxMissing: 5, Limit: 20, UseSoonBefore: time.Now()}
+	contains := func(rows []coverageRow, id int64) bool {
+		for _, row := range rows {
+			if row.RecipeID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	before, err := repo.Coverage(ctx, q)
+	if err != nil {
+		t.Fatalf("Coverage() error = %v", err)
+	}
+	if !contains(before, tomatoPasta) {
+		t.Fatal("the tomato recipe is not returned before tomato is tagged, so the test proves nothing")
+	}
+
+	if _, err := pool.Exec(ctx, `
+INSERT INTO ingredient_allergens (ingredient_id, allergen)
+SELECT id, 'nightshade' FROM ingredients_catalog WHERE canonical_name = 'tomato'`); err != nil {
+		t.Fatalf("tag tomato: %v", err)
+	}
+	after, err := repo.Coverage(ctx, q)
+	if err != nil {
+		t.Fatalf("Coverage() error = %v", err)
+	}
+	if contains(after, tomatoPasta) {
+		t.Fatal("a recipe with a newly tagged allergen was returned for a user who denies it")
+	}
+}
+
+// recipes.ingredient_ids is what search reads, so every way of changing the links
+// must reach it: a stale array would rank by the wrong ingredients and could let a
+// recipe through the allergen overlap.
+func TestRecipeIngredientIDsFollowTheLinks(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	ctx := context.Background()
+
+	assertInStep := func(t *testing.T) {
+		t.Helper()
+		var stale int
+		err := pool.QueryRow(ctx, `
+SELECT count(*) FROM recipes r
+WHERE r.ingredient_ids IS DISTINCT FROM coalesce(
+    (SELECT array_agg(ri.ingredient_id::int ORDER BY ri.ingredient_id)
+     FROM recipe_ingredients ri WHERE ri.recipe_id = r.id), '{}')`).Scan(&stale)
+		if err != nil {
+			t.Fatalf("compare arrays: %v", err)
+		}
+		if stale != 0 {
+			t.Fatalf("%d recipes have ingredient_ids out of step with recipe_ingredients", stale)
+		}
+	}
+	exec := func(t *testing.T, sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec: %v", err)
+		}
+	}
+
+	t.Run("after the load", func(t *testing.T) {
+		var ids []int64
+		if err := pool.QueryRow(ctx, `SELECT ingredient_ids FROM recipes WHERE id = $1`,
+			seed.chickenRice).Scan(&ids); err != nil {
+			t.Fatalf("read array: %v", err)
+		}
+		if len(ids) != 3 {
+			t.Fatalf("ingredient_ids = %v, want the three linked ingredients", ids)
+		}
+		assertInStep(t)
+	})
+	t.Run("delete", func(t *testing.T) {
+		exec(t, `DELETE FROM recipe_ingredients WHERE recipe_id = $1 AND ingredient_id = $2`,
+			seed.chickenRice, seed.saltID)
+		assertInStep(t)
+	})
+	t.Run("multi-row insert", func(t *testing.T) {
+		exec(t, `INSERT INTO recipe_ingredients (recipe_id, ingredient_id, raw_text)
+VALUES ($1, $3, 'salt'), ($2, $3, 'salt')`, seed.chickenRice, seed.longRecipe, seed.saltID)
+		assertInStep(t)
+	})
+	t.Run("update moves a link to another recipe", func(t *testing.T) {
+		exec(t, `UPDATE recipe_ingredients SET recipe_id = $2 WHERE recipe_id = $1 AND ingredient_id = $3`,
+			seed.chickenRice, seed.creamyPasta, seed.chickenID)
+		assertInStep(t)
+	})
+	t.Run("recipe deleted with its links", func(t *testing.T) {
+		exec(t, `DELETE FROM recipes WHERE id = $1`, seed.fiveShort)
+		assertInStep(t)
+	})
+	t.Run("truncate", func(t *testing.T) {
+		exec(t, `TRUNCATE recipe_ingredients`)
+		assertInStep(t)
+	})
+}
+
+// ingredient_ids is int4 because intarray is, while catalog ids are bigint. An id
+// that does not fit must be refused when linked, never dropped from the array,
+// and search must not fail when such an id is in a fridge or a dislike list.
+func TestIngredientIDsOutsideInt4(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	ctx := context.Background()
+
+	const bigID = int64(3_000_000_000)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO ingredients_catalog (id, canonical_name) VALUES ($1, 'oversized id')`, bigID); err != nil {
+		t.Fatalf("insert catalog row: %v", err)
+	}
+
+	t.Run("linking it to a recipe is refused", func(t *testing.T) {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO recipe_ingredients (recipe_id, ingredient_id, raw_text) VALUES ($1, $2, 'x')`,
+			seed.chickenRice, bigID)
+		if err == nil {
+			t.Fatal("a link with an id outside int4 was stored, so ingredient_ids cannot hold it")
+		}
+	})
+
+	t.Run("search ignores it in the fridge and the dislikes", func(t *testing.T) {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO user_ingredients (user_id, ingredient_id) VALUES ($1, $2)`,
+			seed.userID, bigID); err != nil {
+			t.Fatalf("insert fridge item: %v", err)
+		}
+		rows, err := NewRetrievalRepo(pool).Coverage(ctx, Query{
+			UserID: seed.userID, DislikedIDs: []int64{bigID},
+			MaxMissing: 0, Limit: 20, UseSoonBefore: time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("Coverage() error = %v", err)
+		}
+		if len(rows) == 0 || rows[0].RecipeID != seed.chickenRice {
+			t.Fatalf("Coverage() = %v, want the fully covered recipe first", rows)
+		}
+	})
+}
+
 func TestSetCoverageExcludesDislikedIngredients(t *testing.T) {
 	pool, cleanup := testPool(t)
 	defer cleanup()
