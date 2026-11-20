@@ -145,6 +145,42 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "429": { $ref: "#/components/responses/TooManyRequests" }
 
+  /api/v1/me:
+    delete:
+      tags: [me]
+      summary: Delete the account
+      description: |
+        Deletes the caller's account and everything stored for it: preferences,
+        fridge, refresh tokens, history and generation runs. Cannot be undone.
+
+        The password is required again so that an unlocked device is not enough.
+        A wrong password is 403, not 401, so a client that refreshes on 401 does
+        not mistake it for an expired access token. The endpoint shares the rate
+        limit of the auth endpoints.
+
+        Access tokens are not revocable, but once the account is gone every
+        request with one gets 401. An adaptation job still running finishes; its
+        result is not stored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        "204": { description: Account deleted }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The password is incorrect
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
   /api/v1/me/prefs:
     get:
       tags: [me]

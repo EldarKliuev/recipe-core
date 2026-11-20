@@ -45,6 +45,24 @@ func (f *fakeRepo) UserByEmail(_ context.Context, email string) (User, error) {
 	return u, nil
 }
 
+func (f *fakeRepo) UserByID(_ context.Context, id uuid.UUID) (User, error) {
+	for _, u := range f.users {
+		if u.ID == id {
+			return u, nil
+		}
+	}
+	return User{}, httpx.ErrNotFound
+}
+
+func (f *fakeRepo) DeleteUser(_ context.Context, id uuid.UUID) error {
+	for email, u := range f.users {
+		if u.ID == id {
+			delete(f.users, email)
+		}
+	}
+	return nil
+}
+
 func (f *fakeRepo) StoreRefreshToken(_ context.Context, digest []byte, userID uuid.UUID, _ time.Time) error {
 	f.refresh[string(digest)] = userID
 	return nil
@@ -243,4 +261,70 @@ func keys(m map[string]User) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// registeredUser registers cook@example.com and returns its id.
+func registeredUser(t *testing.T, svc *Service, repo *fakeRepo) uuid.UUID {
+	t.Helper()
+	if _, err := svc.Register(context.Background(), "cook@example.com", goodPassword); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	return repo.users["cook@example.com"].ID
+}
+
+func TestDeleteAccountWithTheRightPasswordRemovesTheUser(t *testing.T) {
+	svc, repo := testService()
+	id := registeredUser(t, svc, repo)
+
+	if err := svc.DeleteAccount(context.Background(), id, goodPassword); err != nil {
+		t.Fatalf("DeleteAccount() error = %v", err)
+	}
+	if _, ok := repo.users["cook@example.com"]; ok {
+		t.Error("user is still stored after DeleteAccount()")
+	}
+}
+
+// A wrong password must not delete anything, and must not be 401: clients
+// answer 401 with a token refresh rather than an error message.
+func TestDeleteAccountWithAWrongPasswordIsForbiddenAndKeepsTheUser(t *testing.T) {
+	svc, repo := testService()
+	id := registeredUser(t, svc, repo)
+
+	err := svc.DeleteAccount(context.Background(), id, "not the password")
+	if !errors.Is(err, httpx.ErrForbidden) {
+		t.Fatalf("DeleteAccount() error = %v, want ErrForbidden", err)
+	}
+	if _, ok := repo.users["cook@example.com"]; !ok {
+		t.Error("user was deleted despite the wrong password")
+	}
+}
+
+func TestDeleteAccountRequiresAPassword(t *testing.T) {
+	svc, repo := testService()
+	id := registeredUser(t, svc, repo)
+
+	if err := svc.DeleteAccount(context.Background(), id, ""); !errors.Is(err, httpx.ErrInvalidInput) {
+		t.Fatalf("DeleteAccount() error = %v, want ErrInvalidInput", err)
+	}
+	if _, ok := repo.users["cook@example.com"]; !ok {
+		t.Error("user was deleted without a password")
+	}
+}
+
+// The password is checked against the caller's own account, so another user's
+// password cannot delete it and the caller cannot delete anyone else.
+func TestDeleteAccountChecksTheCallersOwnPassword(t *testing.T) {
+	svc, repo := testService()
+	owner := registeredUser(t, svc, repo)
+	if _, err := svc.Register(context.Background(), "other@example.com", "another long password"); err != nil {
+		t.Fatalf("Register(other) error = %v", err)
+	}
+
+	err := svc.DeleteAccount(context.Background(), owner, "another long password")
+	if !errors.Is(err, httpx.ErrForbidden) {
+		t.Fatalf("DeleteAccount() with the other user's password error = %v, want ErrForbidden", err)
+	}
+	if len(repo.users) != 2 {
+		t.Errorf("users left = %v, want both accounts", keys(repo.users))
+	}
 }

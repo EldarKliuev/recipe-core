@@ -86,6 +86,7 @@ func run() error {
 		Config:      cfg,
 		Log:         log,
 		Tokens:      tokens,
+		Users:       authRepo,
 		RateLimiter: rateLimiter,
 		Auth:        auth.NewHandler(auth.NewService(authRepo, tokens)),
 		User:        user.NewHandler(userRepo, catalogRepo),

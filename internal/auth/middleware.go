@@ -9,13 +9,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/recipe-ai/core-api/internal/platform/authctx"
 	"github.com/recipe-ai/core-api/internal/platform/httpx"
 )
 
+// UserChecker reports whether an account still exists.
+type UserChecker interface {
+	UserExists(ctx context.Context, id uuid.UUID) (bool, error)
+}
+
 // Middleware rejects requests without a valid access token and puts the caller
-// id into the request context.
-func Middleware(tokens *TokenIssuer) func(http.Handler) http.Handler {
+// id into the request context. Access tokens cannot be revoked, so the account
+// is looked up on every request: a deleted user's token must get 401 rather
+// than reach handlers and fail on foreign keys.
+func Middleware(tokens *TokenIssuer, users UserChecker) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			raw, ok := bearerToken(r)
@@ -25,6 +33,15 @@ func Middleware(tokens *TokenIssuer) func(http.Handler) http.Handler {
 			}
 			userID, err := tokens.ParseAccessToken(raw)
 			if err != nil {
+				httpx.Fail(w, r, fmt.Errorf("%w: invalid access token", httpx.ErrUnauthorized))
+				return
+			}
+			exists, err := users.UserExists(r.Context(), userID)
+			if err != nil {
+				httpx.Fail(w, r, err)
+				return
+			}
+			if !exists {
 				httpx.Fail(w, r, fmt.Errorf("%w: invalid access token", httpx.ErrUnauthorized))
 				return
 			}

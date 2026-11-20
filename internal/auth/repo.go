@@ -73,6 +73,42 @@ func (r *Repo) UserByEmail(ctx context.Context, email string) (User, error) {
 	return u, nil
 }
 
+func (r *Repo) UserByID(ctx context.Context, id uuid.UUID) (User, error) {
+	var u User
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, email, password_hash, created_at FROM users WHERE id = $1`, id,
+	).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return u, httpx.ErrNotFound
+	}
+	if err != nil {
+		return u, fmt.Errorf("select user by id: %w", err)
+	}
+	return u, nil
+}
+
+// UserExists lets the access-token middleware reject tokens of a deleted
+// account: access tokens are not revocable and outlive the user by up to
+// JWT_ACCESS_TTL.
+func (r *Repo) UserExists(ctx context.Context, id uuid.UUID) (bool, error) {
+	var exists bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)`, id).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check user exists: %w", err)
+	}
+	return exists, nil
+}
+
+// DeleteUser removes the account. Every per-user table references users with
+// ON DELETE CASCADE, so prefs, fridge, refresh tokens, history and generation
+// runs go with it.
+func (r *Repo) DeleteUser(ctx context.Context, id uuid.UUID) error {
+	if _, err := r.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("delete user: %w", err)
+	}
+	return nil
+}
+
 func (r *Repo) StoreRefreshToken(ctx context.Context, digest []byte, userID uuid.UUID, expiresAt time.Time) error {
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)`,
