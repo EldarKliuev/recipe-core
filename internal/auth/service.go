@@ -17,6 +17,8 @@ import (
 type repository interface {
 	CreateUser(ctx context.Context, u User) error
 	UserByEmail(ctx context.Context, email string) (User, error)
+	UserByID(ctx context.Context, id uuid.UUID) (User, error)
+	DeleteUser(ctx context.Context, id uuid.UUID) error
 	StoreRefreshToken(ctx context.Context, digest []byte, userID uuid.UUID, expiresAt time.Time) error
 	ConsumeRefreshToken(ctx context.Context, digest []byte) (uuid.UUID, error)
 }
@@ -97,6 +99,31 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (Tokens, err
 		return Tokens{}, err
 	}
 	return s.issue(ctx, userID)
+}
+
+// DeleteAccount removes the caller's account after re-checking the password, so
+// an unlocked phone left on the table is not enough to delete it. A wrong
+// password is 403 rather than 401: clients treat 401 as an expired access token
+// and would refresh instead of telling the user.
+func (s *Service) DeleteAccount(ctx context.Context, userID uuid.UUID, password string) error {
+	if password == "" {
+		return httpx.Invalidf("password is required")
+	}
+	user, err := s.repo.UserByID(ctx, userID)
+	if errors.Is(err, httpx.ErrNotFound) {
+		return fmt.Errorf("%w: account no longer exists", httpx.ErrUnauthorized)
+	}
+	if err != nil {
+		return err
+	}
+	ok, err := VerifyPassword(password, user.PasswordHash)
+	if err != nil {
+		return fmt.Errorf("verify password: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("%w: password is incorrect", httpx.ErrForbidden)
+	}
+	return s.repo.DeleteUser(ctx, userID)
 }
 
 func (s *Service) issue(ctx context.Context, userID uuid.UUID) (Tokens, error) {

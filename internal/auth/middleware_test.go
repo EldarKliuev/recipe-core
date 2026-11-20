@@ -23,7 +23,7 @@ func TestMiddlewarePutsCallerInContext(t *testing.T) {
 	}
 
 	var seen uuid.UUID
-	handler := Middleware(issuer)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(issuer, knownUsers{userID: true})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen, _ = authctx.UserID(r.Context())
 	}))
 
@@ -42,7 +42,7 @@ func TestMiddlewarePutsCallerInContext(t *testing.T) {
 
 func TestMiddlewareRejectsMissingAndMalformedTokens(t *testing.T) {
 	issuer := NewTokenIssuer([]byte("test-secret-that-is-long-enough-32"), time.Minute, time.Hour)
-	handler := Middleware(issuer)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(issuer, knownUsers{})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("handler ran for an unauthenticated request")
 	}))
 
@@ -63,6 +63,61 @@ func TestMiddlewareRejectsMissingAndMalformedTokens(t *testing.T) {
 				t.Errorf("status = %d, want 401", rec.Code)
 			}
 		})
+	}
+}
+
+// knownUsers is the set of accounts that still exist.
+type knownUsers map[uuid.UUID]bool
+
+func (k knownUsers) UserExists(_ context.Context, id uuid.UUID) (bool, error) {
+	return k[id], nil
+}
+
+type brokenUsers struct{}
+
+func (brokenUsers) UserExists(context.Context, uuid.UUID) (bool, error) {
+	return false, errors.New("postgres is down")
+}
+
+// Access tokens outlive a deleted account; the middleware must turn them away
+// before they reach handlers.
+func TestMiddlewareRejectsATokenOfADeletedUser(t *testing.T) {
+	issuer := NewTokenIssuer([]byte("test-secret-that-is-long-enough-32"), time.Minute, time.Hour)
+	token, _, err := issuer.AccessToken(uuid.New())
+	if err != nil {
+		t.Fatalf("AccessToken() error = %v", err)
+	}
+	handler := Middleware(issuer, knownUsers{})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler ran for a deleted user")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/me/prefs", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+}
+
+// A failed lookup is not proof the user is gone: it must not log them out with a
+// 401, and it must not let the request through unchecked either.
+func TestMiddlewareFailsClosedWithoutLoggingOutWhenTheLookupFails(t *testing.T) {
+	issuer := NewTokenIssuer([]byte("test-secret-that-is-long-enough-32"), time.Minute, time.Hour)
+	token, _, err := issuer.AccessToken(uuid.New())
+	if err != nil {
+		t.Fatalf("AccessToken() error = %v", err)
+	}
+	handler := Middleware(issuer, brokenUsers{})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler ran although the account could not be checked")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/me/prefs", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
 	}
 }
 

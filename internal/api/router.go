@@ -26,6 +26,7 @@ type Deps struct {
 	Config      config.Config
 	Log         *slog.Logger
 	Tokens      *auth.TokenIssuer
+	Users       auth.UserChecker
 	RateLimiter *auth.RateLimiter
 
 	Auth      *auth.Handler
@@ -74,9 +75,10 @@ func NewRouter(d Deps) http.Handler {
 		r.Mount("/auth", d.Auth.Routes(d.RateLimiter.Middleware))
 
 		r.Group(func(r chi.Router) {
-			r.Use(auth.Middleware(d.Tokens))
+			r.Use(auth.Middleware(d.Tokens, d.Users))
 
 			r.Route("/me", func(r chi.Router) {
+				r.With(d.RateLimiter.Middleware).Delete("/", d.Auth.DeleteAccount)
 				r.Get("/prefs", d.User.GetPrefs)
 				r.Put("/prefs", d.User.PutPrefs)
 				r.Mount("/ingredients", d.Inventory.Routes())

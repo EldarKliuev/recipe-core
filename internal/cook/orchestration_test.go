@@ -134,14 +134,23 @@ func (s *scriptedLLM) Adapt(context.Context, LLMAdaptRequest) (LLMAdaptResponse,
 type recordingStore struct {
 	adapted []recipehistory.Entry
 	runs    []recipehistory.Run
+	// err fails every write, as Postgres does when the user was deleted while
+	// the job ran and the foreign key on users is violated.
+	err error
 }
 
 func (r *recordingStore) SaveAdapted(_ context.Context, a recipehistory.Entry) error {
+	if r.err != nil {
+		return r.err
+	}
 	r.adapted = append(r.adapted, a)
 	return nil
 }
 
 func (r *recordingStore) SaveRun(_ context.Context, run recipehistory.Run) error {
+	if r.err != nil {
+		return r.err
+	}
 	r.runs = append(r.runs, run)
 	return nil
 }
@@ -245,6 +254,22 @@ func TestWorkerStoresValidatedResultAndRecordsTheRun(t *testing.T) {
 	}
 	if len(h.store.runs) != 1 || h.store.runs[0].Status != recipehistory.RunSuccess {
 		t.Errorf("runs = %+v, want a single successful run", h.store.runs)
+	}
+}
+
+// History is secondary (CLAUDE.md §7): when the user deleted their account
+// mid-job the inserts fail on the foreign key, and the job must still finish.
+func TestWorkerFinishesTheJobWhenHistoryCannotBeWritten(t *testing.T) {
+	h := newHarness(t, []llmReply{{resp: goodResponse()}}, 2)
+	h.store.err = errors.New(`insert or update on table "adapted_recipes" violates foreign key constraint`)
+
+	job := h.runJob(t, user.Prefs{})
+
+	if job.Status != JobDone {
+		t.Fatalf("Status = %q, want %q (error: %s)", job.Status, JobDone, job.Error)
+	}
+	if job.Result == nil || !job.Result.Adapted {
+		t.Errorf("Result = %+v, want the adapted recipe despite the failed history write", job.Result)
 	}
 }
 
