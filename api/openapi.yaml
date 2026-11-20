@@ -825,6 +825,18 @@ components:
           type: array
           description: Model-paraphrased steps. Never verbatim corpus directions.
           items: { type: string }
+        step_minutes:
+          type: array
+          description: |
+            Timer for each step in minutes, parallel to `steps` (same length), null
+            where timing does not matter. Values come from the model and are kept
+            only between 1 and 480; anything else becomes null, and when the model
+            returns a list of the wrong length every value is null. Empty in a
+            fallback. Absent from results saved before this field existed.
+          items:
+            type: [integer, "null"]
+            minimum: 1
+            maximum: 480
         model: { type: string }
         warnings:
           type: array

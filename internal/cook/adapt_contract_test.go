@@ -124,3 +124,34 @@ func TestEmptyIfNilLeavesPopulatedSlicesAlone(t *testing.T) {
 		t.Errorf("emptyIfNil(nil) = %v, want an empty non-nil slice", got)
 	}
 }
+
+// The response side of the same contract: a body shaped like llm-service's
+// AdaptResponse must fill every field. A misspelt tag would not fail decoding,
+// it would leave the field empty, and for step_minutes that silently means no
+// timers at all.
+func TestAdaptResponseDecodesTheLLMServiceSchema(t *testing.T) {
+	body := `{
+		"recipe": {
+			"base_recipe_id": 7,
+			"title": "Rice bowl",
+			"steps": ["Rinse the rice.", "Simmer the rice."],
+			"step_minutes": [null, 18],
+			"used_ingredients": ["rice"],
+			"missing_ingredients": [],
+			"substitutions": [{"missing": "butter", "replace_with": "oil", "note": "dairy-free"}]
+		},
+		"meta": {"provider": "lmstudio", "model": "qwen", "prompt_version": "v2"}
+	}`
+	var got LLMAdaptResponse
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	r := got.Recipe
+	if r.BaseRecipeID != 7 || r.Title != "Rice bowl" || len(r.Steps) != 2 ||
+		len(r.UsedIngredients) != 1 || len(r.Substitutions) != 1 {
+		t.Errorf("Recipe = %+v, want every field filled", r)
+	}
+	if len(r.StepMinutes) != 2 || r.StepMinutes[0] != nil || r.StepMinutes[1] == nil || *r.StepMinutes[1] != 18 {
+		t.Errorf("StepMinutes = %v, want [null 18]", r.StepMinutes)
+	}
+}

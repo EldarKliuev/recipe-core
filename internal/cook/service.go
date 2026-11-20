@@ -632,6 +632,7 @@ func (s *Service) fallbackResult(ctx context.Context, recipeID int64, haveIDs []
 		Missing:        []Ingredient{},
 		Substitutions:  []Substitution{},
 		Steps:          []string{},
+		StepMinutes:    []*int{},
 		Base:           rec,
 	}
 	for _, ri := range ingredients[recipeID] {

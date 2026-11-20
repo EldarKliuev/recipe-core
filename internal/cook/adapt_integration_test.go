@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -186,6 +187,7 @@ func TestAdaptEndToEndProducesAValidatedResult(t *testing.T) {
 			BaseRecipeID:    *chosen.ID,
 			Title:           "Spicy chicken and rice",
 			Steps:           []string{"Rinse the rice.", "Sear the chicken.", "Simmer together."},
+			StepMinutes:     []*int{nil, ptr(4), ptr(20)},
 			UsedIngredients: []string{"chicken breast", "rice", "salt"},
 			Substitutions: []LLMSubstitution{
 				{Missing: "soy sauce", ReplaceWith: "salt", Note: "not in your fridge"},
@@ -259,6 +261,9 @@ func TestAdaptEndToEndProducesAValidatedResult(t *testing.T) {
 	if len(res.Steps) != 3 {
 		t.Errorf("steps = %v, want the three paraphrased steps", res.Steps)
 	}
+	if got := minutes(res.StepMinutes); !reflect.DeepEqual(got, []int{0, 4, 20}) {
+		t.Errorf("step_minutes = %v (0 is null), want the stub's [null 4 20] carried through", got)
+	}
 	if res.Model != "qwen/qwen3.5-9b" {
 		t.Errorf("model = %q, want it recorded from the run metadata", res.Model)
 	}
@@ -317,8 +322,9 @@ func TestAdaptEndToEndRejectsAnAllergenAnswerAndFallsBack(t *testing.T) {
 		}
 	}
 	// Corpus directions are an internal reference and must not be published.
-	if len(done.Result.Steps) != 0 {
-		t.Errorf("steps = %v, want none in a fallback", done.Result.Steps)
+	if len(done.Result.Steps) != 0 || len(done.Result.StepMinutes) != 0 {
+		t.Errorf("steps = %v, step_minutes = %v, want none in a fallback",
+			done.Result.Steps, done.Result.StepMinutes)
 	}
 
 	// Both rejected attempts must be recorded so the rejection rate is measurable.

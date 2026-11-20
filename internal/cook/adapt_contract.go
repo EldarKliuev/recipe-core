@@ -62,9 +62,12 @@ type LLMAdaptResponse struct {
 // amounts, so quantities in the result are taken from the corpus row rather than
 // from anything the model said.
 type LLMAdaptedRecipe struct {
-	BaseRecipeID       int64             `json:"base_recipe_id"`
-	Title              string            `json:"title"`
-	Steps              []string          `json:"steps"`
+	BaseRecipeID int64    `json:"base_recipe_id"`
+	Title        string   `json:"title"`
+	Steps        []string `json:"steps"`
+	// StepMinutes runs parallel to Steps: same length, nil where timing does not
+	// matter. Values are not range-checked on the far side; Validator does it.
+	StepMinutes        []*int            `json:"step_minutes"`
 	UsedIngredients    []string          `json:"used_ingredients"`
 	MissingIngredients []string          `json:"missing_ingredients"`
 	Substitutions      []LLMSubstitution `json:"substitutions"`

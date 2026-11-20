@@ -112,9 +112,12 @@ type Result struct {
 	Missing        []Ingredient   `json:"missing_ingredients"`
 	Substitutions  []Substitution `json:"substitutions"`
 	Steps          []string       `json:"steps"`
-	Model          string         `json:"model,omitempty"`
-	Warnings       []string       `json:"warnings,omitempty"`
-	Base           catalog.Recipe `json:"base_recipe"`
+	// StepMinutes runs parallel to Steps, nil where a step has no timer. It is
+	// empty in a fallback, which has no steps.
+	StepMinutes []*int         `json:"step_minutes"`
+	Model       string         `json:"model,omitempty"`
+	Warnings    []string       `json:"warnings,omitempty"`
+	Base        catalog.Recipe `json:"base_recipe"`
 }
 
 // Substitution records a swap the model made, e.g. yoghurt for sour cream.
