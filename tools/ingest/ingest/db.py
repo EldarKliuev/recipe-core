@@ -80,7 +80,11 @@ def upsert_staples(conn: psycopg.Connection, ingredient_ids: Iterable[int]) -> i
 
 def load_recipes(conn: psycopg.Connection, recipes: Iterator[dict], name_to_id: dict[str, int],
                  batch_size: int = 1000) -> tuple[int, int]:
-    """Insert recipes and their ingredient links. Returns (recipes, links)."""
+    """Insert recipes and their ingredient links. Returns (recipes, links).
+
+    `step_ingredient_ids` is rewritten on a re-run as well, so loading again over
+    an existing corpus applies the step ids without a reset.
+    """
     recipe_count = 0
     link_count = 0
     batch: list[dict] = []
@@ -92,15 +96,18 @@ def load_recipes(conn: psycopg.Connection, recipes: Iterator[dict], name_to_id: 
             cur.executemany(
                 """INSERT INTO recipes
                        (external_id, title, category, subcategory, description,
-                        steps, num_ingredients, num_steps, source)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (external_id) DO UPDATE SET title = excluded.title
+                        steps, num_ingredients, num_steps, source, step_ingredient_ids)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (external_id) DO UPDATE
+                       SET title = excluded.title,
+                           step_ingredient_ids = excluded.step_ingredient_ids
                    RETURNING id, external_id""",
                 [
                     (
                         r["external_id"], r["title"], r["category"], r["subcategory"],
                         r["description"], json.dumps(r["directions"]),
                         r["num_ingredients"], r["num_steps"], r["source"],
+                        r.get("step_ingredient_ids", []),
                     )
                     for r in rows
                 ],

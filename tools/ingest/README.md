@@ -30,6 +30,26 @@ tag the name has; otherwise the name is promoted like any other tagged name.
 `catalog` fails if any synonym still loses a tag, and `load` repeats that check
 against the reviewed tags.
 
+Part of the corpus lists fewer ingredients than its steps use: "Red Velvet
+Brownies" (`kaggle64k-10059`) lists one line of butter, while the steps add flour,
+cocoa and eggs. `load` therefore also writes `recipes.step_ingredient_ids`, the
+catalog ids (canonical names and synonyms, longest name first) that the
+directions name, and the search deny-list reads them next to the listed ids.
+Coverage ignores them. Any mention counts, "grease with butter" included: a
+spurious id only hides a recipe from a user allergic to it. The bare words
+`sauce`, `seasoning`, `roll`, `dough`, `crust`, `pastry` and `cream` are skipped
+(`STEP_GENERIC_NAMES`), because in steps they mean the dish's own part, and
+`sauce` and `seasoning` carry all 13 tags. Longer names (`soy sauce`, `ice cream`)
+still count.
+
+On the 2026-11-20 corpus `load` reports 8 368 of 62 126 recipes whose steps add an
+allergen that no listed line has (484 of them list one or two ingredients):
+wheat 2547, gluten 2538, soy 2359, dairy 2307, eggs 1806, peanuts 1199,
+tree_nuts 1135, sulfites 1060, celery 702, fish 669, mustard 634, sesame 607,
+shellfish 527. The most frequent sources are `egg`, `flour`, `butter`,
+`cooking spray` and `nut`. With every catalog name, the bare words included, it
+was 15 082, and `sauce` alone hid 6 663 recipes from every allergy.
+
 ## Pipeline
 
 ```

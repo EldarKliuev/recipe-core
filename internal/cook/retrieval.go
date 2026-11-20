@@ -55,6 +55,12 @@ type coverageRow struct {
 // by a spelling difference. The denied ids come from ingredient_allergens on every
 // call, so the tags themselves are never copied and cannot go stale.
 //
+// The deny-list also reads recipes.step_ingredient_ids, the catalog ids ingest
+// found in the directions (migration 00008). Part of the corpus lists fewer
+// ingredients than its steps use, so the listed ids alone would show a recipe
+// whose flour is named only in the steps to a user allergic to gluten. Coverage
+// ignores that array: a step mention is not an ingredient the user has to buy.
+//
 // Every array is built sorted. intarray sorts both operands on each call, and
 // Postgres' sort returns at once on sorted input, so an unsorted deny-list of a
 // few hundred ids made the allergen overlap the most expensive step of the query.
@@ -102,6 +108,7 @@ coverage AS (
       AND ($5 <= 0 OR r.num_ingredients <= $5)
       AND (cardinality($6::text[]) = 0 OR r.category = ANY($6::text[]))
       AND NOT (r.ingredient_ids && denied.ids)
+      AND NOT (r.step_ingredient_ids && denied.ids)
       AND NOT (r.ingredient_ids && disliked.ids)
 )
 SELECT recipe_id, total_count, missing_count, use_soon_count
@@ -145,8 +152,8 @@ func (r *RetrievalRepo) Coverage(ctx context.Context, q Query) ([]coverageRow, e
 }
 
 // IsRetrievableFor reports whether a recipe passes the same missing-count,
-// allergen and dislike checks as retrieval. Paging and the category and
-// complexity filters are ignored. Adaptation uses it to reject requests for
+// allergen (listed and step ids) and dislike checks as retrieval. Paging and the
+// category and complexity filters are ignored. Adaptation uses it to reject requests for
 // recipes the user could not have been offered.
 func (r *RetrievalRepo) IsRetrievableFor(ctx context.Context, q Query, recipeID int64) (bool, error) {
 	allergens := q.Allergens
@@ -175,6 +182,10 @@ SELECT EXISTS (
     SELECT 1 FROM recipe_ingredients x
     JOIN ingredient_allergens a ON a.ingredient_id = x.ingredient_id
     WHERE x.recipe_id = $3 AND a.allergen = ANY($2::text[])
+) AND NOT EXISTS (
+    SELECT 1 FROM recipes s
+    JOIN ingredient_allergens a ON a.ingredient_id = ANY(s.step_ingredient_ids)
+    WHERE s.id = $3 AND a.allergen = ANY($2::text[])
 ) AND NOT EXISTS (
     SELECT 1 FROM recipe_ingredients d
     WHERE d.recipe_id = $3 AND d.ingredient_id = ANY($5::bigint[])
