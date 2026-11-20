@@ -71,11 +71,12 @@ func NewRouter(d Deps) http.Handler {
 		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 
+	requireAuth := auth.Middleware(d.Tokens, d.Users)
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Mount("/auth", d.Auth.Routes(d.RateLimiter.Middleware))
+		r.Mount("/auth", d.Auth.Routes(d.RateLimiter.Middleware, requireAuth))
 
 		r.Group(func(r chi.Router) {
-			r.Use(auth.Middleware(d.Tokens, d.Users))
+			r.Use(requireAuth)
 
 			r.Route("/me", func(r chi.Router) {
 				r.With(d.RateLimiter.Middleware).Delete("/", d.Auth.DeleteAccount)

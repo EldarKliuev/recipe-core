@@ -21,6 +21,7 @@ type repository interface {
 	DeleteUser(ctx context.Context, id uuid.UUID) error
 	StoreRefreshToken(ctx context.Context, digest []byte, userID uuid.UUID, expiresAt time.Time) error
 	ConsumeRefreshToken(ctx context.Context, digest []byte) (uuid.UUID, error)
+	RevokeRefreshToken(ctx context.Context, digest []byte, userID uuid.UUID) error
 }
 
 type Service struct {
@@ -99,6 +100,15 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (Tokens, err
 		return Tokens{}, err
 	}
 	return s.issue(ctx, userID)
+}
+
+// Logout revokes the caller's refresh token so a copy of it stops working. The
+// access token is not revocable and simply expires; the client drops it.
+func (s *Service) Logout(ctx context.Context, userID uuid.UUID, refreshToken string) error {
+	if refreshToken == "" {
+		return httpx.Invalidf("refresh_token is required")
+	}
+	return s.repo.RevokeRefreshToken(ctx, HashRefreshToken(refreshToken), userID)
 }
 
 // DeleteAccount removes the caller's account after re-checking the password, so

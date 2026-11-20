@@ -90,6 +90,40 @@ func TestRevokeUserTokensLeavesOtherUsersTokensLive(t *testing.T) {
 	}
 }
 
+// Logout revokes by token and owner together: the caller's token stops working,
+// a foreign token is left alone, and repeating the logout is not an error.
+func TestRevokeRefreshTokenOnlyRevokesTheOwnersToken(t *testing.T) {
+	pool, cleanup := pgtest.Pool(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewRepo(pool)
+	owner, other := pgtest.User(t, pool), pgtest.User(t, pool)
+	expires := time.Now().Add(time.Hour)
+
+	if err := repo.StoreRefreshToken(ctx, []byte("owner"), owner, expires); err != nil {
+		t.Fatalf("StoreRefreshToken(owner) error = %v", err)
+	}
+	if err := repo.StoreRefreshToken(ctx, []byte("other"), other, expires); err != nil {
+		t.Fatalf("StoreRefreshToken(other) error = %v", err)
+	}
+
+	if err := repo.RevokeRefreshToken(ctx, []byte("other"), owner); err != nil {
+		t.Fatalf("RevokeRefreshToken(foreign) error = %v", err)
+	}
+	for range 2 {
+		if err := repo.RevokeRefreshToken(ctx, []byte("owner"), owner); err != nil {
+			t.Fatalf("RevokeRefreshToken(own) error = %v", err)
+		}
+	}
+
+	if _, err := repo.ConsumeRefreshToken(ctx, []byte("owner")); !errors.Is(err, httpx.ErrUnauthorized) {
+		t.Errorf("revoked token error = %v, want ErrUnauthorized", err)
+	}
+	if got, err := repo.ConsumeRefreshToken(ctx, []byte("other")); err != nil || got != other {
+		t.Errorf("foreign token = (%s, %v), want it still usable", got, err)
+	}
+}
+
 func TestCreateUserRejectsAnEmailThatDiffersOnlyInCase(t *testing.T) {
 	pool, cleanup := pgtest.Pool(t)
 	defer cleanup()

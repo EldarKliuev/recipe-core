@@ -78,6 +78,14 @@ func (f *fakeRepo) ConsumeRefreshToken(_ context.Context, digest []byte) (uuid.U
 	return userID, nil
 }
 
+func (f *fakeRepo) RevokeRefreshToken(_ context.Context, digest []byte, userID uuid.UUID) error {
+	key := string(digest)
+	if owner, ok := f.refresh[key]; ok && owner == userID {
+		f.consumed[key] = true
+	}
+	return nil
+}
+
 func testService() (*Service, *fakeRepo) {
 	repo := newFakeRepo()
 	issuer := NewTokenIssuer([]byte("test-secret-that-is-long-enough-32"), time.Minute, time.Hour)
@@ -326,5 +334,52 @@ func TestDeleteAccountChecksTheCallersOwnPassword(t *testing.T) {
 	}
 	if len(repo.users) != 2 {
 		t.Errorf("users left = %v, want both accounts", keys(repo.users))
+	}
+}
+
+func TestLogoutRevokesTheRefreshToken(t *testing.T) {
+	svc, repo := testService()
+	tokens, err := svc.Register(context.Background(), "cook@example.com", goodPassword)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	owner := repo.users["cook@example.com"].ID
+
+	if err := svc.Logout(context.Background(), owner, tokens.RefreshToken); err != nil {
+		t.Fatalf("Logout() error = %v", err)
+	}
+	if _, err := svc.Refresh(context.Background(), tokens.RefreshToken); !errors.Is(err, httpx.ErrUnauthorized) {
+		t.Errorf("refresh after logout error = %v, want ErrUnauthorized", err)
+	}
+}
+
+// Logout must not become a way to kill someone else's session, and must answer
+// the same for tokens it does not own so it reveals nothing about them.
+func TestLogoutDoesNotRevokeAnotherUsersToken(t *testing.T) {
+	svc, repo := testService()
+	if _, err := svc.Register(context.Background(), "cook@example.com", goodPassword); err != nil {
+		t.Fatalf("Register(cook) error = %v", err)
+	}
+	other, err := svc.Register(context.Background(), "other@example.com", goodPassword)
+	if err != nil {
+		t.Fatalf("Register(other) error = %v", err)
+	}
+	caller := repo.users["cook@example.com"].ID
+
+	if err := svc.Logout(context.Background(), caller, other.RefreshToken); err != nil {
+		t.Fatalf("Logout() with a foreign token error = %v, want nil", err)
+	}
+	if err := svc.Logout(context.Background(), caller, "never-issued"); err != nil {
+		t.Fatalf("Logout() with an unknown token error = %v, want nil", err)
+	}
+	if _, err := svc.Refresh(context.Background(), other.RefreshToken); err != nil {
+		t.Errorf("other user's refresh after a foreign logout error = %v, want it still usable", err)
+	}
+}
+
+func TestLogoutRequiresARefreshToken(t *testing.T) {
+	svc, _ := testService()
+	if err := svc.Logout(context.Background(), uuid.New(), ""); !errors.Is(err, httpx.ErrInvalidInput) {
+		t.Fatalf("Logout() error = %v, want ErrInvalidInput", err)
 	}
 }

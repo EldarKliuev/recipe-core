@@ -138,6 +138,20 @@ func (r *Repo) ConsumeRefreshToken(ctx context.Context, digest []byte) (uuid.UUI
 	return userID, nil
 }
 
+// RevokeRefreshToken revokes the token only if it belongs to userID. An unknown,
+// foreign, expired or already revoked token is not an error: logout answers the
+// same either way, so it reveals nothing about tokens it does not own.
+func (r *Repo) RevokeRefreshToken(ctx context.Context, digest []byte, userID uuid.UUID) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE refresh_tokens SET revoked_at = now()
+		 WHERE token_hash = $1 AND user_id = $2 AND revoked_at IS NULL`,
+		digest, userID)
+	if err != nil {
+		return fmt.Errorf("revoke refresh token: %w", err)
+	}
+	return nil
+}
+
 func (r *Repo) RevokeUserTokens(ctx context.Context, userID uuid.UUID) error {
 	_, err := r.pool.Exec(ctx,
 		`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`,
