@@ -94,3 +94,49 @@ remainder, both optional and both off by default:
 
 Check `data/work/unresolved.csv` before reaching for either: most of what lands
 there is worth fixing with a rule.
+
+## Search latency on the loaded corpus
+
+The plan's acceptance target is p95 < 150 ms for `POST /cook/matches`. The
+integration seed is four recipes, so speed is measured on the ingested corpus:
+
+```bash
+make bench-search   # BENCH_DATABASE_URL defaults to the dev database
+```
+
+`BenchmarkSearch` (`internal/cook/retrieval_bench_test.go`) never runs DDL. It
+adds throwaway users whose fridges hold the 5, 15 or 40 most frequent
+non-staple ingredients (the worst case: they pull the most recipes into the
+search), with no allergens and with `gluten` + `dairy`, then deletes them. It
+times `RetrievalRepo.Coverage` alone and the whole `Service.Matches`, 200
+iterations each, and reports p50/p95/max.
+
+### 2026-11-20
+
+Dev database: 62 126 recipes, 533 211 ingredient rows, 1 584 catalog entries,
+loaded before the TASK-01–03 fixes (TASK-21). Postgres 16 from compose with
+default settings (`work_mem` 4MB, `shared_buffers` 128MB), Apple M4 Pro, warm
+cache.
+
+| Fridge | Allergens | `Coverage` p50 / p95, ms | `Matches` p50 / p95, ms |
+|---|---|---|---|
+| 5 | — | 127 / 149 | 128 / 141 |
+| 5 | gluten, dairy | 156 / 178 | 153 / 162 |
+| 15 | — | 174 / 185 | 177 / 198 |
+| 15 | gluten, dairy | 204 / 230 | 193 / 213 |
+| 40 | — | 190 / 208 | 197 / 216 |
+| 40 | gluten, dairy | 203 / 234 | 197 / 208 |
+
+**The target is not met** for any fridge above 5 items, or for 5 items with
+allergens. Hydrating the 20 results costs almost nothing next to the coverage
+query; the two columns differ by noise.
+
+`EXPLAIN (ANALYZE, BUFFERS)` for 40 items with allergens (334 ms under
+`EXPLAIN`): the `candidates` CTE keeps 56 836 of 62 126 recipes, because
+frequent ingredients appear almost everywhere. The coverage aggregate then
+groups 510 480 rows of a sequential scan of `recipe_ingredients`, and the
+HashAggregate spills to disk in 5 batches with 4MB `work_mem`. The allergen
+`NOT EXISTS` is a second full scan of `recipe_ingredients` hashed against 265
+tagged ingredients. Indexes are not the issue: the plan reads most of the table
+on purpose. The next step is the denormalisation described at `setCoverageSQL`
+(TASK-39).
