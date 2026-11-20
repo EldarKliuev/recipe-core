@@ -2,6 +2,7 @@ package cook
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -633,4 +634,100 @@ func equal(got, want []string) bool {
 		seen[w]--
 	}
 	return true
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// minutes flattens step timers for comparison, writing a null as 0.
+func minutes(in []*int) []int {
+	out := make([]int, len(in))
+	for i, m := range in {
+		if m != nil {
+			out[i] = *m
+		}
+	}
+	return out
+}
+
+func validateSteps(t *testing.T, steps []string, stepMinutes []*int) Result {
+	t.Helper()
+	v, in := testValidator()
+	got, err := v.Validate(context.Background(), in, LLMAdaptedRecipe{
+		BaseRecipeID:    100,
+		UsedIngredients: []string{"chicken breast", "rice"},
+		Steps:           steps,
+		StepMinutes:     stepMinutes,
+	})
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	return got
+}
+
+func TestValidateKeepsStepMinutesAlignedWithSteps(t *testing.T) {
+	got := validateSteps(t,
+		[]string{"Rinse the rice.", "Simmer the rice.", "Sear the chicken."},
+		[]*int{nil, ptr(18), ptr(6)})
+
+	if want := []int{0, 18, 6}; !reflect.DeepEqual(minutes(got.StepMinutes), want) {
+		t.Errorf("StepMinutes = %v (0 is null), want %v", minutes(got.StepMinutes), want)
+	}
+	if got.StepMinutes[0] != nil {
+		t.Error("StepMinutes[0] is set, want null for a step without a timer")
+	}
+}
+
+// The model sometimes puts 0 on a step like "drain". A value out of bounds loses
+// only its own timer; the recipe and the other timers stay.
+func TestValidateClearsOnlyTheStepMinutesOutOfBounds(t *testing.T) {
+	got := validateSteps(t,
+		[]string{"Drain the rice.", "Simmer.", "Rest overnight.", "Serve.", "Plate.", "Braise."},
+		[]*int{ptr(0), ptr(1), ptr(481), ptr(-5), ptr(480), ptr(90)})
+
+	if !got.Adapted {
+		t.Fatal("Adapted = false; a bad timer must not reject the recipe")
+	}
+	if want := []int{0, 1, 0, 0, 480, 90}; !reflect.DeepEqual(minutes(got.StepMinutes), want) {
+		t.Errorf("StepMinutes = %v (0 is null), want %v", minutes(got.StepMinutes), want)
+	}
+	for _, i := range []int{0, 2, 3} {
+		if got.StepMinutes[i] != nil {
+			t.Errorf("StepMinutes[%d] = %d, want null", i, *got.StepMinutes[i])
+		}
+	}
+}
+
+// With a different length there is no telling which value belongs to which
+// step, so every timer goes, and so do they when an older llm-service sends none.
+func TestValidateClearsEveryStepMinuteWhenTheLengthDiffers(t *testing.T) {
+	for name, stepMinutes := range map[string][]*int{
+		"shorter": {ptr(5)},
+		"longer":  {ptr(5), ptr(10), ptr(15)},
+		"absent":  nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := validateSteps(t, []string{"Cook the rice.", "Sear the chicken."}, stepMinutes)
+			if !got.Adapted {
+				t.Fatal("Adapted = false; a bad timer list must not reject the recipe")
+			}
+			if len(got.StepMinutes) != 2 || got.StepMinutes[0] != nil || got.StepMinutes[1] != nil {
+				t.Errorf("StepMinutes = %v, want two nulls", minutes(got.StepMinutes))
+			}
+		})
+	}
+}
+
+// Empty steps are dropped; their timers must go with them, or every later timer
+// would shift onto the wrong step.
+func TestValidateDropsTheMinutesOfAnEmptyStep(t *testing.T) {
+	got := validateSteps(t,
+		[]string{"Cook the rice.", "  ", "Sear the chicken."},
+		[]*int{ptr(18), ptr(3), ptr(6)})
+
+	if want := []string{"Cook the rice.", "Sear the chicken."}; !reflect.DeepEqual(got.Steps, want) {
+		t.Errorf("Steps = %v, want %v", got.Steps, want)
+	}
+	if want := []int{18, 6}; !reflect.DeepEqual(minutes(got.StepMinutes), want) {
+		t.Errorf("StepMinutes = %v, want %v", minutes(got.StepMinutes), want)
+	}
 }

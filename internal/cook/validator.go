@@ -194,9 +194,10 @@ func (v *Validator) Validate(ctx context.Context, in ValidationInput, out LLMAda
 		Used:          []Ingredient{},
 		Missing:       []Ingredient{},
 		Substitutions: []Substitution{},
-		Steps:         nonEmpty(out.Steps),
 		Base:          base,
 	}
+
+	result.Steps, result.StepMinutes = stepsWithMinutes(out.Steps, out.StepMinutes)
 
 	// Amounts come from the corpus row for this recipe: the model returns bare
 	// names, and an invented quantity would be worse than none.
@@ -325,6 +326,38 @@ func splitWords(text string) []string {
 	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
 	})
+}
+
+// Step timers outside these bounds are dropped. The model sometimes puts 0 on a
+// step like "drain"; more than eight hours is an overnight rest, not a timer in
+// cook mode.
+const (
+	minStepMinutes = 1
+	maxStepMinutes = 480
+)
+
+// stepsWithMinutes drops empty steps together with their minutes, so the two
+// lists stay aligned, and clears each value outside the bounds. Timers never
+// reject a recipe: when the lengths differ there is no telling which value
+// belongs to which step, so every timer is cleared instead.
+func stepsWithMinutes(steps []string, minutes []*int) ([]string, []*int) {
+	aligned := len(minutes) == len(steps)
+	outSteps := make([]string, 0, len(steps))
+	outMinutes := make([]*int, 0, len(steps))
+	for i, step := range steps {
+		step = strings.TrimSpace(step)
+		if step == "" {
+			continue
+		}
+		var m *int
+		if aligned && minutes[i] != nil && *minutes[i] >= minStepMinutes && *minutes[i] <= maxStepMinutes {
+			v := *minutes[i]
+			m = &v
+		}
+		outSteps = append(outSteps, step)
+		outMinutes = append(outMinutes, m)
+	}
+	return outSteps, outMinutes
 }
 
 func nonEmpty(in []string) []string {
