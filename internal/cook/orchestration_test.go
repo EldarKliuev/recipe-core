@@ -49,10 +49,22 @@ type fakeRetrieval struct {
 	err         error
 	// lastRetrievableQuery is the query IsRetrievableFor was last called with.
 	lastRetrievableQuery Query
+	// lastRecipeQuery is the query RecipeCoverage was last called with.
+	lastRecipeQuery Query
 }
 
 func (f *fakeRetrieval) Coverage(context.Context, Query) ([]coverageRow, error) {
 	return f.rows, f.err
+}
+
+func (f *fakeRetrieval) RecipeCoverage(_ context.Context, q Query, recipeID int64) (coverageRow, bool, error) {
+	f.lastRecipeQuery = q
+	for _, row := range f.rows {
+		if row.RecipeID == recipeID {
+			return row, true, f.err
+		}
+	}
+	return coverageRow{}, false, f.err
 }
 
 func (f *fakeRetrieval) IsRetrievableFor(_ context.Context, q Query, _ int64) (bool, error) {
@@ -254,6 +266,32 @@ func TestWorkerStoresValidatedResultAndRecordsTheRun(t *testing.T) {
 	}
 	if len(h.store.runs) != 1 || h.store.runs[0].Status != recipehistory.RunSuccess {
 		t.Errorf("runs = %+v, want a single successful run", h.store.runs)
+	}
+}
+
+// A card that opens must also be adaptable, so the lookup uses Adapt's bound for
+// a chosen recipe rather than the search default.
+func TestRecipeLooksUpAtTheWidestMaxMissing(t *testing.T) {
+	h := newHarness(t, nil, 2)
+	retrieval := h.svc.retrieval.(*fakeRetrieval)
+
+	match, err := h.svc.Recipe(context.Background(), h.userID, 100)
+	if err != nil {
+		t.Fatalf("Recipe() error = %v", err)
+	}
+	if match.RecipeID != 100 || match.MissingCount != 1 {
+		t.Errorf("Recipe() = %+v, want recipe 100 with one missing", match)
+	}
+	if retrieval.lastRecipeQuery.MaxMissing != maxMaxMissing {
+		t.Errorf("MaxMissing = %d, want %d", retrieval.lastRecipeQuery.MaxMissing, maxMaxMissing)
+	}
+}
+
+func TestRecipeThatIsNotAMatchIsNotFound(t *testing.T) {
+	h := newHarness(t, nil, 2)
+
+	if _, err := h.svc.Recipe(context.Background(), h.userID, 999); !errors.Is(err, httpx.ErrNotFound) {
+		t.Fatalf("Recipe() error = %v, want ErrNotFound", err)
 	}
 }
 

@@ -12,13 +12,18 @@ package cook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/recipe-ai/core-api/internal/catalog"
+	"github.com/recipe-ai/core-api/internal/platform/httpx"
 	"github.com/recipe-ai/core-api/internal/platform/postgres/pgtest"
+	"github.com/recipe-ai/core-api/internal/user"
 )
 
 func TestSetCoverageRanksByMissingThenTotal(t *testing.T) {
@@ -490,6 +495,122 @@ type corpusSeed struct {
 	pastaID     int64
 	tomatoID    int64
 	parmesanID  int64
+}
+
+// recipeService is the search path over real repositories; the adaptation
+// dependencies are not needed for it.
+func recipeService(pool *pgxpool.Pool) *Service {
+	return NewService(NewRetrievalRepo(pool), catalog.NewRepo(pool), user.NewRepo(pool), nil, nil, nil)
+}
+
+// The card and the search must agree on every field for the same recipe, which
+// is the point of building both from one query.
+func TestRecipeByIDMatchesTheSearchResult(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	svc := recipeService(pool)
+	ctx := context.Background()
+
+	search, err := svc.Matches(ctx, seed.userID, MatchesRequest{})
+	if err != nil {
+		t.Fatalf("Matches() error = %v", err)
+	}
+	for _, want := range []int64{seed.chickenRice, seed.creamyPasta} {
+		var fromSearch *Match
+		for i := range search.Items {
+			if search.Items[i].RecipeID == want {
+				fromSearch = &search.Items[i]
+			}
+		}
+		if fromSearch == nil {
+			t.Fatalf("recipe %d is not in the search results; the seed changed", want)
+		}
+		got, err := svc.Recipe(ctx, seed.userID, want)
+		if err != nil {
+			t.Fatalf("Recipe(%d) error = %v", want, err)
+		}
+		if !reflect.DeepEqual(got, *fromSearch) {
+			t.Errorf("Recipe(%d) =\n%+v\nsearch has\n%+v", want, got, *fromSearch)
+		}
+	}
+}
+
+func TestRecipeByIDWithADeniedAllergenIsNotFound(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	svc := recipeService(pool)
+	ctx := context.Background()
+
+	// Without the allergy the recipe opens, so the 404 below is the allergen.
+	if _, err := svc.Recipe(ctx, seed.userID, seed.creamyPasta); err != nil {
+		t.Fatalf("Recipe() without allergens error = %v", err)
+	}
+	if err := user.NewRepo(pool).SavePrefs(ctx, seed.userID, user.Prefs{Allergens: []string{"dairy"}}); err != nil {
+		t.Fatalf("SavePrefs() error = %v", err)
+	}
+	if _, err := svc.Recipe(ctx, seed.userID, seed.creamyPasta); !errors.Is(err, httpx.ErrNotFound) {
+		t.Fatalf("Recipe() with a dairy allergy error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecipeByIDWithADislikedIngredientIsNotFound(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	svc := recipeService(pool)
+	ctx := context.Background()
+
+	if err := user.NewRepo(pool).SavePrefs(ctx, seed.userID,
+		user.Prefs{DislikedIngredientIDs: []int64{seed.basilID}}); err != nil {
+		t.Fatalf("SavePrefs() error = %v", err)
+	}
+	if _, err := svc.Recipe(ctx, seed.userID, seed.fiveShort); !errors.Is(err, httpx.ErrNotFound) {
+		t.Fatalf("Recipe() with disliked basil error = %v, want ErrNotFound", err)
+	}
+}
+
+// A recipe that fell out of the default search still opens up to the widest
+// max_missing, with the grown missing list, and not beyond it.
+func TestRecipeByIDAcceptsUpToTheWidestMaxMissing(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	svc := recipeService(pool)
+	ctx := context.Background()
+
+	got, err := svc.Recipe(ctx, seed.userID, seed.fiveShort)
+	if err != nil {
+		t.Fatalf("Recipe(five short) error = %v", err)
+	}
+	if got.MissingCount != 5 || len(got.Missing) != 5 {
+		t.Errorf("missing = %d (%d listed), want 5", got.MissingCount, len(got.Missing))
+	}
+	if _, err := svc.Recipe(ctx, seed.userID, seed.elevenShort); !errors.Is(err, httpx.ErrNotFound) {
+		t.Errorf("Recipe(eleven short) error = %v, want ErrNotFound", err)
+	}
+	if _, err := svc.Recipe(ctx, seed.userID, 1<<40); !errors.Is(err, httpx.ErrNotFound) {
+		t.Errorf("Recipe(unknown id) error = %v, want ErrNotFound", err)
+	}
+}
+
+// Coverage is the caller's own: the same recipe is not a match for a user whose
+// fridge has none of it.
+func TestRecipeByIDIsMeasuredAgainstTheCallersFridge(t *testing.T) {
+	pool, cleanup := testPool(t)
+	defer cleanup()
+	seed := seedCorpus(t, pool)
+	svc := recipeService(pool)
+	ctx := context.Background()
+	other := pgtest.User(t, pool)
+	if _, err := pool.Exec(ctx, `INSERT INTO user_prefs (user_id) VALUES ($1)`, other); err != nil {
+		t.Fatalf("insert prefs: %v", err)
+	}
+
+	if _, err := svc.Recipe(ctx, other, seed.chickenRice); !errors.Is(err, httpx.ErrNotFound) {
+		t.Fatalf("Recipe() for a user with an empty fridge error = %v, want ErrNotFound", err)
+	}
 }
 
 // testPool keeps the name every cook integration test already uses; the

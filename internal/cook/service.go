@@ -20,6 +20,7 @@ import (
 
 type retriever interface {
 	Coverage(ctx context.Context, q Query) ([]coverageRow, error)
+	RecipeCoverage(ctx context.Context, q Query, recipeID int64) (coverageRow, bool, error)
 	IsRetrievableFor(ctx context.Context, q Query, recipeID int64) (bool, error)
 	HaveIngredientIDs(ctx context.Context, userID uuid.UUID) ([]int64, error)
 }
@@ -101,6 +102,39 @@ func (s *Service) Matches(ctx context.Context, userID uuid.UUID, req MatchesRequ
 		InventorySize: len(fridgeIDs),
 		Allergens:     allergens,
 	}, nil
+}
+
+// Recipe is one search match by id, measured against the current fridge, so a
+// client can reopen a recipe card without repeating the search. It accepts the
+// recipe up to the widest max_missing, the same bound Adapt uses for a chosen
+// recipe, so a card that opens can also be adapted. A recipe with a denied
+// allergen or a disliked ingredient, or none of the fridge, is 404 like an
+// unknown id. Like search, it never returns the corpus directions.
+func (s *Service) Recipe(ctx context.Context, userID uuid.UUID, recipeID int64) (Match, error) {
+	q, _, err := s.buildQuery(ctx, userID, MatchesRequest{})
+	if err != nil {
+		return Match{}, err
+	}
+	q.MaxMissing = maxMaxMissing
+	row, ok, err := s.retrieval.RecipeCoverage(ctx, q, recipeID)
+	if err != nil {
+		return Match{}, err
+	}
+	if !ok {
+		return Match{}, fmt.Errorf("%w: recipe", httpx.ErrNotFound)
+	}
+	haveIDs, err := s.retrieval.HaveIngredientIDs(ctx, userID)
+	if err != nil {
+		return Match{}, err
+	}
+	matches, err := s.hydrate(ctx, []coverageRow{row}, haveIDs)
+	if err != nil {
+		return Match{}, err
+	}
+	if len(matches) == 0 {
+		return Match{}, fmt.Errorf("%w: recipe", httpx.ErrNotFound)
+	}
+	return matches[0], nil
 }
 
 func (s *Service) buildQuery(ctx context.Context, userID uuid.UUID, req MatchesRequest) (Query, user.Prefs, error) {

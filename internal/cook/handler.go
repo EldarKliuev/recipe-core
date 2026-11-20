@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -24,6 +25,7 @@ func NewHandler(svc *Service) *Handler {
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Post("/matches", h.matches)
+	r.Get("/recipes/{recipeID}", h.recipe)
 	r.Post("/adapt", h.adapt)
 	r.Get("/jobs/{jobID}", h.job)
 	return r
@@ -49,6 +51,25 @@ func (h *Handler) matches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) recipe(w http.ResponseWriter, r *http.Request) {
+	userID, err := authctx.UserID(r.Context())
+	if err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	recipeID, err := strconv.ParseInt(chi.URLParam(r, "recipeID"), 10, 64)
+	if err != nil {
+		httpx.Fail(w, r, httpx.Invalidf("recipeID must be an integer"))
+		return
+	}
+	match, err := h.svc.Recipe(r.Context(), userID, recipeID)
+	if err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, match)
 }
 
 type adaptResponse struct {

@@ -2,10 +2,12 @@ package cook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -71,7 +73,16 @@ type coverageRow struct {
 //
 // Ranking is missing_count then total_count; the near-expiry count and step count
 // are tie-breakers below those.
-const setCoverageSQL = `
+//
+// The query text is built by coverageSQL so that search and the single-recipe
+// lookup share every filter; scope adds a condition to the coverage CTE.
+var (
+	setCoverageSQL    = coverageSQL("")
+	recipeCoverageSQL = coverageSQL("AND r.id = $10")
+)
+
+func coverageSQL(scope string) string {
+	return `
 WITH fridge AS (
     SELECT coalesce(array_agg(ingredient_id::int ORDER BY ingredient_id) FILTER (WHERE ingredient_id <= 2147483647), '{}') AS ids
     FROM user_ingredients WHERE user_id = $1
@@ -110,6 +121,7 @@ coverage AS (
       AND NOT (r.ingredient_ids && denied.ids)
       AND NOT (r.step_ingredient_ids && denied.ids)
       AND NOT (r.ingredient_ids && disliked.ids)
+      ` + scope + `
 )
 SELECT recipe_id, total_count, missing_count, use_soon_count
 FROM coverage
@@ -117,24 +129,10 @@ WHERE missing_count <= $3
 ORDER BY missing_count ASC, total_count ASC,
          use_soon_count DESC, num_steps ASC, recipe_id ASC
 LIMIT $9`
+}
 
 func (r *RetrievalRepo) Coverage(ctx context.Context, q Query) ([]coverageRow, error) {
-	allergens := q.Allergens
-	if allergens == nil {
-		allergens = []string{}
-	}
-	disliked := q.DislikedIDs
-	if disliked == nil {
-		disliked = []int64{}
-	}
-	categories := q.Categories
-	if categories == nil {
-		categories = []string{}
-	}
-
-	rows, err := r.pool.Query(ctx, setCoverageSQL,
-		q.UserID, allergens, q.MaxMissing, q.MaxSteps, q.MaxIngredients,
-		categories, disliked, q.UseSoonBefore, q.Limit)
+	rows, err := r.pool.Query(ctx, setCoverageSQL, coverageArgs(q)...)
 	if err != nil {
 		return nil, fmt.Errorf("set-coverage query: %w", err)
 	}
@@ -149,6 +147,43 @@ func (r *RetrievalRepo) Coverage(ctx context.Context, q Query) ([]coverageRow, e
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+// RecipeCoverage runs the search for one recipe: the same coverage, allergen
+// and dislike filters, with the paging and the category and complexity filters
+// of q switched off. ok is false when the recipe would not be a match.
+func (r *RetrievalRepo) RecipeCoverage(ctx context.Context, q Query, recipeID int64) (coverageRow, bool, error) {
+	q.MaxSteps, q.MaxIngredients, q.Categories, q.Limit = 0, 0, nil, 1
+	var row coverageRow
+	err := r.pool.QueryRow(ctx, recipeCoverageSQL, append(coverageArgs(q), recipeID)...).
+		Scan(&row.RecipeID, &row.TotalCount, &row.MissingCount, &row.UseSoonCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return coverageRow{}, false, nil
+	}
+	if err != nil {
+		return coverageRow{}, false, fmt.Errorf("recipe coverage query: %w", err)
+	}
+	return row, true, nil
+}
+
+// coverageArgs binds q to $1-$9 of coverageSQL. Lists are never nil: a nil slice
+// binds as SQL NULL, and cardinality(NULL) is not 0.
+func coverageArgs(q Query) []any {
+	allergens := q.Allergens
+	if allergens == nil {
+		allergens = []string{}
+	}
+	disliked := q.DislikedIDs
+	if disliked == nil {
+		disliked = []int64{}
+	}
+	categories := q.Categories
+	if categories == nil {
+		categories = []string{}
+	}
+
+	return []any{q.UserID, allergens, q.MaxMissing, q.MaxSteps, q.MaxIngredients,
+		categories, disliked, q.UseSoonBefore, q.Limit}
 }
 
 // IsRetrievableFor reports whether a recipe passes the same missing-count,
